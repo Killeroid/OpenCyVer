@@ -93,6 +93,10 @@ def snapshot(transport):
     A single validation asks the same questions many times (is ``Goal`` a label? does ``Goal`` have
     ``code``?). Inside a snapshot each is asked once. Nothing is kept after the outermost block ends, so
     the next validation sees any change made to the graph. Snapshots nest. Works around ``await`` as well.
+
+    A snapshot belongs to the thread or asyncio task that opened it. Tasks it starts, and a copied context
+    (``asyncio.to_thread``, ``contextvars.copy_context().run``), inherit it and share its answers; a new
+    ``threading.Thread`` does not.
     """
     active = _snapshots.get() or {}
     if transport in active:
@@ -144,8 +148,9 @@ class AsyncTransport:
 
     The ``falkordb.asyncio`` client is bound to the event loop that first used it (its connections cannot
     be used from another loop), so use one client, and one transport, per loop. The limit on requests in
-    flight is kept per loop as well, so a transport that is used from another loop starts a new one
-    instead of failing on a semaphore that belongs to the first.
+    flight belongs to the loop the transport last ran in: used from another loop, it starts a new limit
+    instead of failing on a semaphore that belongs to the first. Several loops running at the same time
+    (one per thread) are therefore not limited as a whole.
     """
 
     def __init__(self, select_graph, max_concurrency=8):
@@ -276,26 +281,48 @@ async def _answer_async(request, transport, answers):
     return tuple(outcomes)
 
 
+class _InFlight:
+    """A request being answered, and how many waiters share the answer."""
+
+    __slots__ = ("task", "waiters")
+
+    def __init__(self, task):
+        self.task = task
+        self.waiters = 0
+
+
 async def _answer_one_async(request, transport, answers):
     if answers is None:
         return await transport.run(request)
-    # What is kept is the task answering the request, so a request already in flight is awaited, not sent again
-    task = answers.get(request)
-    if task is None:
+    # What is kept is the request being answered, so one already in flight is awaited, not sent again
+    pending = answers.get(request)
+    if pending is None:
         task = asyncio.ensure_future(transport.run(request))
-        answers[request] = task
-        task.add_done_callback(lambda done: _forget_if_failed(answers, request, done))
-    # Shielded: one waiter being cancelled must not cancel the request the others are waiting for
-    return await asyncio.shield(task)
+        pending = answers[request] = _InFlight(task)
+        task.add_done_callback(lambda _: _forget_if_failed(answers, request, pending))
+    pending.waiters += 1
+    try:
+        # Shielded: one waiter being cancelled must not cancel the request the others are waiting for
+        return await asyncio.shield(pending.task)
+    finally:
+        pending.waiters -= 1
+        if pending.waiters == 0 and not pending.task.done():
+            # The last waiter is gone (cancelled, for example by a timeout), so nobody needs the answer:
+            # stop the query, which frees its slot. Forget it now, not when the task ends, so that a run
+            # arriving in between asks again instead of joining a request that is being cancelled.
+            pending.task.cancel()
+            if answers.get(request) is pending:
+                del answers[request]
 
 
-def _forget_if_failed(answers, request, task):
+def _forget_if_failed(answers, request, pending):
     """A request that failed is not kept, so that asking again asks the database again.
 
     This runs before the waiters resume, so a waiter that retries finds no stale failure. Reading
     ``task.exception()`` also marks the error as retrieved, in case every waiter was cancelled.
     """
+    task = pending.task
     if (task.cancelled() or task.exception() is not None) and answers.get(
         request
-    ) is task:
+    ) is pending:
         del answers[request]
