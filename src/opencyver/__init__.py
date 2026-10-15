@@ -5,4 +5,9 @@ try:
 except PackageNotFoundError:
     __version__ = "unknown"
 
-__all__ = ["__version__"]
+from opencyver.validators.syntax_validator import SyntaxValidator
+
+__all__ = [
+    "SyntaxValidator",
+    "__version__",
+]
