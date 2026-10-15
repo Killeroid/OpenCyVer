@@ -1,3 +1,17 @@
+## v3.1.0 (unreleased)
+
+### Added
+
+* **Async API.** `AsyncSyntaxValidator`, `AsyncSchemaValidator` and `AsyncPropertiesValidator` validate with a `falkordb.asyncio` client (or one of its graphs). They take the same arguments and give the same results as the sync validators; `validate()` and `extract()` are coroutines. Each takes `max_concurrency` (default 8), the most requests in flight at once on its connection. A validation that is cancelled, by `asyncio.wait_for` for example, cancels the queries it started and frees their slots.
+* `opencyver.backend.AsyncFalkorDBBackend` and `get_async_backend()`, the async counterparts of `FalkorDBBackend` and `get_backend()`, and `opencyver.utils.get_paths_after_inference_async()`.
+* Queries that run together inside one `backend.snapshot()` share their lookups, including requests that are still in flight, so validating many queries at once with `asyncio.gather` asks the database each question once.
+
+### Changed
+
+* **A sync validator given an async client raises `TypeError`**, and so does an async validator given a sync one, with a message naming the right classes. (`falkordb`'s `AsyncGraph` is a subclass of `Graph`, so the sync backend now turns it away explicitly.)
+* **Snapshots are scoped to the context, not the thread.** `backend.snapshot()` used to be private to the thread that opened it. It now belongs to the thread or asyncio task that opened it, and is shared with the tasks it starts and with a copied context (`asyncio.to_thread`, `contextvars.copy_context().run`); a new `threading.Thread` still gets none.
+* **The validation logic is written once, as generators**, in the new private modules `opencyver._queries` and `opencyver._io`; the sync and the async validators both run it. The validators' results, errors and round-trips are unchanged: the sync and async validators were compared with the previous release on 270 query and graph combinations. `FalkorDBBackend` keeps all its public methods and gains `run()`; its private helpers (`_ro_query`, `_schema_set`, `_memo`, ...) are gone. `CypherError` and the metadata codes moved to `opencyver._errors` and are still importable from `opencyver.backend`.
+
 ## v3.0.0 (2026-10-15)
 
 OpenCyVer now targets **FalkorDB only**. This repository's history starts with this release; the releases up to 2.0.2 were made in the original [netmode/CyVer](https://gitlab.com/netmode/CyVer) repository, and their notes are kept below.
