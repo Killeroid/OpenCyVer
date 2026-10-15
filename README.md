@@ -171,6 +171,17 @@ uv sync            # create the environment (Python >= 3.12 also installs Falkor
 uv run pytest      # run the tests
 ```
 
+### Releasing
+
+Set `version` in `pyproject.toml`, add the release to `CHANGELOG.md` and commit. Then push a tag with the same version:
+
+```sh
+git tag v3.0.0
+git push origin v3.0.0
+```
+
+[`.github/workflows/publish.yml`](.github/workflows/publish.yml) checks that the tag matches the version, runs the checks and the tests, builds the sdist and the wheel, and publishes them to PyPI from the GitHub environment `pypi`, with PyPI trusted publishing (no token). The one-time setup on PyPI is a trusted publisher with owner `Killeroid`, repository `OpenCyVer`, workflow `publish.yml` and environment `pypi`.
+
 ## License
 
 This project is licensed under the [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) license.

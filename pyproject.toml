@@ -7,7 +7,8 @@ name = "OpenCyVer"
 version = "3.0.0"
 description = "Cypher queries Validators against a given FalkorDB Knowledge Graph schema, in terms of syntax, schema validity, and property access."
 readme = "README.md"
-authors = [{ name = "Ioanna Mandilara", email = "ioanna_mandilara@yahoo.gr" },
+authors = [{ name = "Kwaku Yeboah-Antwi", email = "kwaku@kwaku.is" },
+        { name = "Ioanna Mandilara", email = "ioanna_mandilara@yahoo.gr" },
         { name = "Christina-Maria Androna", email = "androna.xm@gmail.com" }]
 dependencies = [
     "regex>=2024.11.6",

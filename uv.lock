@@ -338,6 +338,21 @@ dev = [
     { name = "ty" },
 ]
 
+[package.metadata]
+requires-dist = [
+    { name = "falkordb", specifier = ">=1.8.0" },
+    { name = "pandas", specifier = ">=2.2.3" },
+    { name = "regex", specifier = ">=2024.11.6" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "falkordblite", marker = "python_full_version >= '3.12'" },
+    { name = "pytest", specifier = ">=9.1.1" },
+    { name = "ruff", specifier = ">=0.17.0" },
+    { name = "ty", specifier = ">=0.0.87" },
+]
+
 [[package]]
 name = "packaging"
 version = "26.3"
