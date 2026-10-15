@@ -271,6 +271,7 @@ class Tracker:
     def __init__(self):
         self.calls = []
         self.fail = set()
+        self.delay = 0.01
         self.in_flight = 0
         self.peak = 0
 
@@ -289,7 +290,7 @@ class FakeAsyncGraph:
         tracker.in_flight += 1
         tracker.peak = max(tracker.peak, tracker.in_flight)
         try:
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(tracker.delay)
         finally:
             tracker.in_flight -= 1
         if query in tracker.fail:
@@ -375,6 +376,55 @@ def test_a_failed_request_is_shared_by_those_waiting_and_then_forgotten():
     assert (
         sent == 2
     )  # once for the failure (shared by both waiters), once for the retry
+
+
+def test_a_timeout_inside_a_snapshot_stops_the_query_and_frees_its_slot():
+    async def main():
+        tracker = Tracker()
+        tracker.delay = 5
+        transport = AsyncTransport(tracker.select_graph, max_concurrency=1)
+        with snapshot(transport):
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(run_async(asks(A), transport), 0.02)
+            await asyncio.sleep(0.01)  # let the cancelled query unwind
+            assert tracker.in_flight == 0
+            tracker.delay = 0.01
+            # the only slot is free again
+            return await asyncio.wait_for(run_async(asks(B), transport), 1)
+
+    assert asyncio.run(main()) == ["rows of B"]
+
+
+def test_a_request_survives_one_of_its_waiters_being_cancelled():
+    async def main():
+        tracker = Tracker()
+        transport = AsyncTransport(tracker.select_graph)
+        with snapshot(transport):
+            first = asyncio.ensure_future(run_async(asks(A), transport))
+            second = asyncio.ensure_future(run_async(asks(A), transport))
+            await asyncio.sleep(0)  # both are now waiting for the one request
+            first.cancel()
+            return await second, len(tracker.calls)
+
+    assert asyncio.run(main()) == (["rows of A"], 1)
+
+
+def test_a_run_arriving_after_the_last_waiter_left_asks_again():
+    async def main():
+        tracker = Tracker()
+        tracker.delay = 5
+        transport = AsyncTransport(tracker.select_graph)
+        with snapshot(transport):
+            first = asyncio.ensure_future(run_async(asks(A), transport))
+            await asyncio.sleep(0)
+            first.cancel()
+            await asyncio.sleep(
+                0
+            )  # the last waiter is gone, so the request is cancelled and forgotten
+            tracker.delay = 0.01
+            return await run_async(asks(A), transport), len(tracker.calls)
+
+    assert asyncio.run(main()) == (["rows of A"], 2)
 
 
 # --------------------------------------------------------------------- transports

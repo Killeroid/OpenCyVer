@@ -70,7 +70,9 @@ class FalkorDBBackend:
         A single validation asks the same questions many times (is ``Goal`` a label? does ``Goal``
         have ``code``? does this path exist?). Inside a snapshot each is asked once. Nothing is kept
         after the outermost block ends, so the next validation sees any change made to the graph.
-        Snapshots nest, and are private to the thread that opened them.
+        Snapshots nest. A snapshot belongs to the thread or asyncio task that opened it: tasks it starts and
+        a copied context (``asyncio.to_thread``, ``contextvars.copy_context().run``) share it, a new
+        ``threading.Thread`` does not.
         """
         return _io.snapshot(self._transport)
 
