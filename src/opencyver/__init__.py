@@ -6,11 +6,17 @@ try:
 except PackageNotFoundError:
     __version__ = "unknown"
 
-from opencyver.validators.properties_validator import PropertiesValidator
-from opencyver.validators.schema_validator import SchemaValidator
-from opencyver.validators.syntax_validator import SyntaxValidator
+from opencyver.validators.properties_validator import (
+    AsyncPropertiesValidator,
+    PropertiesValidator,
+)
+from opencyver.validators.schema_validator import AsyncSchemaValidator, SchemaValidator
+from opencyver.validators.syntax_validator import AsyncSyntaxValidator, SyntaxValidator
 
 __all__ = [
+    "AsyncPropertiesValidator",
+    "AsyncSchemaValidator",
+    "AsyncSyntaxValidator",
     "PropertiesValidator",
     "SchemaValidator",
     "SyntaxValidator",
