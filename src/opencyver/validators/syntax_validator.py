@@ -15,7 +15,7 @@ from opencyver.backend import (
 from opencyver.patterns import strip_literals_and_comments
 
 
-class _SyntaxLogic:
+class _SyntaxValidator:
     """The logic of SyntaxValidator, as generators (see ``opencyver._io``): one copy for the sync and the async validator."""
 
     def __init__(self, driver, check_multilabeled_nodes=True):
@@ -161,7 +161,7 @@ class _SyntaxLogic:
         return False
 
 
-class SyntaxValidator(_SyntaxLogic):
+class SyntaxValidator(_SyntaxValidator):
     """
     A class to validate Cypher queries for correct syntax and label consistency.
     """
