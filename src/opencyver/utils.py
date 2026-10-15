@@ -1,8 +1,12 @@
+from collections.abc import Generator
 from functools import reduce
+from typing import Any
 
 import pandas as pd
 import regex as re
 
+from opencyver._io import Request
+from opencyver._queries import query_to_df
 from opencyver.backend import CypherError, get_backend
 
 
@@ -104,6 +108,14 @@ def get_paths_after_inference(driver, all_paths_with_vars, database_name=None):
     """
 
     backend = get_backend(driver)
+    graph = backend._graph_name(database_name)
+    return backend.run(paths_after_inference(graph, all_paths_with_vars))
+
+
+def paths_after_inference(
+    graph: str, all_paths_with_vars: list
+) -> Generator[Request, Any, list[pd.DataFrame]]:
+    """The logic of :func:`get_paths_after_inference` on the resolved graph name, as a generator (see ``opencyver._io``)."""
     df_list = []  # the final DataFrames
     for path in all_paths_with_vars:
         query_w_labels, node_vars, rel_vars = identify_variables_and_construct_query(
@@ -111,7 +123,7 @@ def get_paths_after_inference(driver, all_paths_with_vars, database_name=None):
         )
         try:
             # dataframe with columns the vars of the path and rows the valid label combinations
-            df_var_labels = backend.query_to_df(query_w_labels, database_name)
+            df_var_labels = yield from query_to_df(graph, query_w_labels)
         except CypherError:
             # The inference query was rejected (e.g. FalkorDB.ClientError.Statement.SyntaxError), so no
             # label combination is known for this path: keep its variables, with no rows

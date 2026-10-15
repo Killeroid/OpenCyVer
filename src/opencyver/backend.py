@@ -94,7 +94,8 @@ class FalkorDBBackend:
         """The ``falkordb.Graph`` to query (a graph is selected by name on every call, not kept open)."""
         return self._select_graph(self._graph_name(database_name))
 
-    def _run(self, generator):
+    def run(self, generator):
+        """Run a logic generator (see ``opencyver._io``) with this backend's connection, and return its value."""
         return _io.run_sync(generator, self._transport)
 
     def index_exists(self, kind, on, label, attribute=None, database_name=None):
@@ -107,7 +108,7 @@ class FalkorDBBackend:
             attribute (str | None): The attribute the index must cover. None: any attribute.
         """
         graph = self._graph_name(database_name)
-        return self._run(_queries.index_exists(graph, kind, on, label, attribute))
+        return self.run(_queries.index_exists(graph, kind, on, label, attribute))
 
     # -------------------------------------------------------------- running queries
     def execute(self, query, database_name=None):
@@ -116,7 +117,7 @@ class FalkorDBBackend:
         Raises:
             CypherError: If the database rejects the query.
         """
-        return self._run(_queries.execute(self._graph_name(database_name), query))
+        return self.run(_queries.execute(self._graph_name(database_name), query))
 
     def explain(self, query, database_name=None):
         """Check a query without executing it.
@@ -127,11 +128,11 @@ class FalkorDBBackend:
         Raises:
             CypherError: If the database rejects the query.
         """
-        return self._run(_queries.explain(self._graph_name(database_name), query))
+        return self.run(_queries.explain(self._graph_name(database_name), query))
 
     def query_to_df(self, query, database_name=None):
         """Run a read query and return the rows as a DataFrame (columns = returned names)."""
-        return self._run(_queries.query_to_df(self._graph_name(database_name), query))
+        return self.run(_queries.query_to_df(self._graph_name(database_name), query))
 
     # ----------------------------------------------------------------- schema checks
     def path_exists(self, path, database_name=None):
@@ -140,11 +141,11 @@ class FalkorDBBackend:
         Returns:
             tuple[bool, list[dict]]: Whether it exists, and warnings about unknown labels/types.
         """
-        return self._run(_queries.path_exists(self._graph_name(database_name), path))
+        return self.run(_queries.path_exists(self._graph_name(database_name), path))
 
     def label_kind(self, label, database_name=None):
         """Return 'node' if ``label`` is a node label, 'relationship' if it is a relationship type, else 'none'."""
-        return self._run(_queries.label_kind(self._graph_name(database_name), label))
+        return self.run(_queries.label_kind(self._graph_name(database_name), label))
 
     def property_exists(self, label, kind, prop, database_name=None):
         """Check whether any node/relationship with ``label`` has property ``prop``.
@@ -155,7 +156,7 @@ class FalkorDBBackend:
         Returns:
             tuple[bool, list[dict]]: Whether it exists, and a warning if the property key is unknown.
         """
-        return self._run(
+        return self.run(
             _queries.property_exists(self._graph_name(database_name), label, kind, prop)
         )
 
