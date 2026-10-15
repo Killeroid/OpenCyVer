@@ -1,6 +1,10 @@
+from collections.abc import Generator
+from typing import Any
+
 import regex as re
 
-from opencyver import patterns
+from opencyver import _queries, patterns
+from opencyver._io import Request
 from opencyver.backend import (
     UNKNOWN_INDEX,
     UNKNOWN_LABEL,
@@ -9,7 +13,8 @@ from opencyver.backend import (
     get_backend,
     snapshotted,
 )
-from opencyver.utils import get_paths_after_inference, replace_with_labels
+from opencyver.utils import paths_after_inference as infer_paths
+from opencyver.utils import replace_with_labels
 
 # `(a)<-[r]-(b)` and `(a)-[r]->(b)`, matched on a path whose property maps were masked.
 # The relationship is optional so that `<--` and `-->` work too.
@@ -53,14 +58,8 @@ def _zero_or_more_hops(path):
     )
 
 
-class SchemaValidator:
-    """
-    A class to validate Cypher queries against the schema of a graph.
-
-    A query is valid if the node labels, relationship types and one-hop paths it uses exist in the graph
-    (with the direction written in the query), and so do the indexes behind the full-text and vector
-    index query procedures it calls. Labels and types that the query leaves out are inferred from the graph.
-    """
+class _SchemaValidator:
+    """The logic of SchemaValidator, as generators (see ``opencyver._io``): one copy for the sync and the async validator."""
 
     def __init__(self, driver):
         """
@@ -76,11 +75,16 @@ class SchemaValidator:
         self.driver = driver
         self.backend = get_backend(driver)
 
-    def __get_path_exists(self, path, database_name):
+    def __get_path_exists(
+        self, path, database_name
+    ) -> Generator[Request, Any, tuple[bool, list]]:
         """Whether the pattern matches anything in the graph, and the warnings about unknown labels and types."""
-        return self.backend.path_exists(path, database_name)
+        graph = self.backend._graph_name(database_name)
+        return (yield from _queries.path_exists(graph, path))
 
-    def __check_path_exists(self, pattern, original_path_map, database_name=None):
+    def __check_path_exists(
+        self, pattern, original_path_map, database_name=None
+    ) -> Generator[Request, Any, tuple[bool, list]]:
         """
         Check if the provided pattern exists in the graph database
 
@@ -100,7 +104,7 @@ class SchemaValidator:
         """
         metadata = []  # the warnings found
         try:
-            pattern_exists, notifications = self.__get_path_exists(
+            pattern_exists, notifications = yield from self.__get_path_exists(
                 pattern, database_name
             )
 
@@ -126,7 +130,7 @@ class SchemaValidator:
                 # Every label and type is known, so the pattern simply does not exist. Only a path can be
                 # explained (wrong direction, ...); a node or relationship is just reported as missing.
                 original_paths = (original_path_map or {}).get(pattern, [])
-                self.__diagnose_missing_path(
+                yield from self.__diagnose_missing_path(
                     pattern, original_paths, database_name, metadata
                 )
             return pattern_exists, metadata
@@ -134,7 +138,9 @@ class SchemaValidator:
             # The pattern cannot be executed (syntax or execution error), so it does not exist
             return False, metadata
 
-    def __diagnose_missing_path(self, pattern, original_paths, database_name, metadata):
+    def __diagnose_missing_path(
+        self, pattern, original_paths, database_name, metadata
+    ) -> Generator[Request, Any, None]:
         """
         Explain why a path whose labels and relationship types are all valid does not exist, and append the
         explanations to ``metadata``. In order of preference the cause is:
@@ -167,7 +173,7 @@ class SchemaValidator:
 
             if (
                 any_hops is not None
-                and self.__get_path_exists(any_hops, database_name)[0]
+                and (yield from self.__get_path_exists(any_hops, database_name))[0]
             ):
                 metadata.append(
                     {
@@ -177,7 +183,7 @@ class SchemaValidator:
                 )
             elif not undirected:
                 metadata.append(unknown)
-            elif self.__get_path_exists(undirected, database_name)[0]:
+            elif (yield from self.__get_path_exists(undirected, database_name))[0]:
                 # It only exists the other way round
                 flipped = _reverse_direction(original)
                 if flipped is None:
@@ -194,7 +200,11 @@ class SchemaValidator:
                 flipped_any_hops = _zero_or_more_hops(flipped) if flipped else None
                 if (
                     flipped_any_hops is not None
-                    and self.__get_path_exists(flipped_any_hops, database_name)[0]
+                    and (
+                        yield from self.__get_path_exists(
+                            flipped_any_hops, database_name
+                        )
+                    )[0]
                 ):
                     metadata.append(
                         {
@@ -205,7 +215,9 @@ class SchemaValidator:
                 else:
                     metadata.append(unknown)
 
-    def __extract_internal(self, query, database_name=None):
+    def __extract_internal(
+        self, query, database_name=None
+    ) -> Generator[Request, Any, tuple[list, list, list, dict]]:
         """
         Extract the node labels, relationship types and one-hop paths of the provided query. Any properties mentioned are stripped.
 
@@ -331,9 +343,8 @@ class SchemaValidator:
                 paths_after_inference = not_inference_paths.copy()
                 # variable -> its inferred label or type ("" if none was found)
                 inference_dict = {}
-                for df in get_paths_after_inference(
-                    self.backend, sorted(inference_paths), database_name
-                ):
+                graph = self.backend._graph_name(database_name)
+                for df in (yield from infer_paths(graph, sorted(inference_paths))):
                     if df.empty:
                         for col in df.columns:
                             inference_dict[col] = ""
@@ -381,51 +392,23 @@ class SchemaValidator:
             )
             return node_paths, index_rel_paths, [], original_path_map
 
-    @snapshotted
-    def extract(self, query, database_name=None):
-        """
-        Extract the node labels, relationship types and one-hop paths of the provided query. Any properties mentioned are stripped.
-
-        Args:
-            query (str): The Cypher query to validate.
-            database_name (str | None) :Database to validate the query against. None (default) uses the database configured on the server side.
-
-        Returns:
-            Three lists: the nodes, the relationships and the one-hop paths of the query, with properties and variables removed.
-        """
+    def _extract(
+        self, query, database_name=None
+    ) -> Generator[Request, Any, tuple[list, list, list]]:
+        """The logic of ``extract``, as a generator."""
         self.backend.check_database(database_name)
-        nodes, rels, paths, _ = self.__extract_internal(query, database_name)
+        nodes, rels, paths, _ = yield from self.__extract_internal(query, database_name)
         paths = [self.__replace_variables_with_empty_string(path) for path in paths]
         return nodes, rels, paths
 
-    @snapshotted
-    def validate(self, query, database_name=None):
-        """
-        Validate the correctness of the nodes, relationships and paths of the provided query
-
-        Args:
-            query (str): The Cypher query to validate.
-            database_name (str | None): The graph to validate the query against. None (default) uses the graph the validator was given.
-
-        Returns:
-            tuple: ``(score, metadata)``.
-
-            score (float): In [0, 1]. The average of the share of the query's nodes that exist, the share of its
-            relationships that exist and the share of its paths that exist (a kind the query does not use is left
-            out; a query with none of them scores 1). If the query calls a full-text or vector index procedure
-            (``db.idx.fulltext.query...``, ``db.idx.vector.query...``) the score is then averaged with the share
-            of those calls that have an index.
-
-            metadata (list[dict]): The problems found, without duplicates. Each dictionary includes:
-            - 'code' (str): ``OpenCyVer.Warning.UnknownLabel``, ``OpenCyVer.Warning.UnknownRelationshipType``,
-              ``OpenCyVer.Warning.UnknownIndex``, or ``UnknownPathWarning``, ``WrongDirectionPathWarning``,
-              ``VariableLengthPathWarning`` or ``WrongDirectionPath&VariableLengthPathWarning`` for a path that does not exist.
-            - 'description' (str): A detailed message describing the issue.
-        """
+    def _validate(
+        self, query, database_name=None
+    ) -> Generator[Request, Any, tuple[float, list[dict]]]:
+        """The logic of ``validate``, as a generator."""
         self.backend.check_database(database_name)
         # The node labels, the relationship types and the one-hop paths of the query (with inferred labels and types),
         # and the mapping of each extracted path to the paths as written in the query
-        nodes, rels, paths, original_path_map = self.__extract_internal(
+        nodes, rels, paths, original_path_map = yield from self.__extract_internal(
             query, database_name
         )
 
@@ -435,7 +418,7 @@ class SchemaValidator:
         if nodes:
             common_nodes = 0
             for node in nodes:
-                node_exists, node_notifications = self.__check_path_exists(
+                node_exists, node_notifications = yield from self.__check_path_exists(
                     node, None, database_name
                 )
                 common_nodes += int(
@@ -449,7 +432,7 @@ class SchemaValidator:
         if rels:
             common_rels = 0
             for rel in rels:
-                rel_exists, rel_notifications = self.__check_path_exists(
+                rel_exists, rel_notifications = yield from self.__check_path_exists(
                     rel, None, database_name
                 )
                 common_rels += int(rel_exists)
@@ -461,7 +444,7 @@ class SchemaValidator:
         if paths:
             common_paths = 0
             for path in paths:
-                path_exists, path_notifications = self.__check_path_exists(
+                path_exists, path_notifications = yield from self.__check_path_exists(
                     path, original_path_map, database_name
                 )
                 common_paths += int(path_exists)
@@ -480,9 +463,12 @@ class SchemaValidator:
             )
         )
         indexed = 0
+        graph = self.backend._graph_name(database_name)
         for call in index_calls:
-            if self.backend.index_exists(
-                call.index, call.on, call.label, call.attribute, database_name
+            if (
+                yield from _queries.index_exists(
+                    graph, call.index, call.on, call.label, call.attribute
+                )
             ):
                 indexed += 1
             else:
@@ -593,3 +579,53 @@ class SchemaValidator:
             lambda m: "()" if m.group(0).startswith("(") else "[]",
             pattern,
         )
+
+
+class SchemaValidator(_SchemaValidator):
+    """
+    A class to validate Cypher queries against the schema of a graph.
+
+    A query is valid if the node labels, relationship types and one-hop paths it uses exist in the graph
+    (with the direction written in the query), and so do the indexes behind the full-text and vector
+    index query procedures it calls. Labels and types that the query leaves out are inferred from the graph.
+    """
+
+    @snapshotted
+    def extract(self, query, database_name=None):
+        """
+        Extract the node labels, relationship types and one-hop paths of the provided query. Any properties mentioned are stripped.
+
+        Args:
+            query (str): The Cypher query to validate.
+            database_name (str | None) :Database to validate the query against. None (default) uses the database configured on the server side.
+
+        Returns:
+            Three lists: the nodes, the relationships and the one-hop paths of the query, with properties and variables removed.
+        """
+        return self.backend.run(self._extract(query, database_name))
+
+    @snapshotted
+    def validate(self, query, database_name=None):
+        """
+        Validate the correctness of the nodes, relationships and paths of the provided query
+
+        Args:
+            query (str): The Cypher query to validate.
+            database_name (str | None): The graph to validate the query against. None (default) uses the graph the validator was given.
+
+        Returns:
+            tuple: ``(score, metadata)``.
+
+            score (float): In [0, 1]. The average of the share of the query's nodes that exist, the share of its
+            relationships that exist and the share of its paths that exist (a kind the query does not use is left
+            out; a query with none of them scores 1). If the query calls a full-text or vector index procedure
+            (``db.idx.fulltext.query...``, ``db.idx.vector.query...``) the score is then averaged with the share
+            of those calls that have an index.
+
+            metadata (list[dict]): The problems found, without duplicates. Each dictionary includes:
+            - 'code' (str): ``OpenCyVer.Warning.UnknownLabel``, ``OpenCyVer.Warning.UnknownRelationshipType``,
+              ``OpenCyVer.Warning.UnknownIndex``, or ``UnknownPathWarning``, ``WrongDirectionPathWarning``,
+              ``VariableLengthPathWarning`` or ``WrongDirectionPath&VariableLengthPathWarning`` for a path that does not exist.
+            - 'description' (str): A detailed message describing the issue.
+        """
+        return self.backend.run(self._validate(query, database_name))

@@ -4,9 +4,12 @@ They pin the current behaviour (no database needed unless noted) so the helpers 
 refactored safely. Private helpers are reached through their name-mangled attributes.
 """
 
+from types import SimpleNamespace
+
 import pandas as pd
 import pytest
 
+from opencyver._io import run_sync
 from opencyver.utils import (
     get_paths_after_inference,
     identify_variables_and_construct_query,
@@ -29,6 +32,7 @@ extract_1hop = private(PropertiesValidator, "extract_1hop_paths")
 prepare_for_infer = private(PropertiesValidator, "prepare_query_for_infer")
 inline_mapping = private(PropertiesValidator, "inline_var_label_properties_mapping")
 outside_mapping = private(PropertiesValidator, "outside_var_properties_mapping")
+diagnose_missing_path = private(SchemaValidator, "diagnose_missing_path")
 
 
 class TestIdentifyVariables:
@@ -181,3 +185,33 @@ class TestGetPathsAfterInference:
             falkordb_client, ["(g)-[:HAS_TARGET]->(t)"], db_name
         )
         assert all(isinstance(df, pd.DataFrame) for df in frames)
+
+
+class TestDiagnoseMissingPath:
+    def test_a_path_that_exists_backwards_with_any_length_is_reported_as_both(
+        self, falkordb_client
+    ):
+        """FalkorDB matches an undirected variable-length path of any length once its ends are connected,
+        so on a real graph this diagnosis is never reached: the direction is blamed first. The existence
+        checks are answered here instead, so that the code which asks them is still exercised."""
+
+        class OnlyTheBackwardsAnyLengthPathExists:
+            def run(self, request):
+                rows = [[1]] if "<-[:R*]-" in request.query else []
+                return SimpleNamespace(header=[(1, "1")], result_set=rows)
+
+        metadata = []
+        run_sync(
+            diagnose_missing_path(
+                SchemaValidator(falkordb_client),
+                "(:C)-[:R*2]->(:A)",  # the extracted path
+                ["(c:C)-[:R*2]->(a:A)"],  # as written in the query
+                "chain",
+                metadata,
+            ),
+            OnlyTheBackwardsAnyLengthPathExists(),
+        )
+
+        (warning,) = metadata
+        assert warning["code"] == "WrongDirectionPath&VariableLengthPathWarning"
+        assert "should be changed to (c:C)<-[:R*]-(a:A)" in warning["description"]
