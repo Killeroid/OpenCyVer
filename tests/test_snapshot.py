@@ -1,10 +1,11 @@
 """Schema lookups are shared within one validation call, and never between calls."""
 
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 
 import falkordb
 import pytest
+from redis.exceptions import ResponseError
 
 from opencyver import PropertiesValidator, SchemaValidator
 from opencyver.backend import get_backend
@@ -61,6 +62,24 @@ class TestSnapshotSemantics:
             for label in ("A", "B", "C"):
                 assert backend.label_kind(label, "no_such_graph") == "none"
         assert calls["n"] == 2  # db.labels() and db.relationshipTypes(), once each
+
+    def test_a_graph_created_during_a_snapshot_keeps_its_empty_schema_until_it_ends(
+        self, falkordb_client
+    ):
+        """A snapshot is one consistent view: what it learned about a graph with no data yet stays true to its end."""
+        backend = get_backend(falkordb_client)
+        name = "created_during_a_snapshot"
+        try:
+            with backend.snapshot():
+                assert backend.label_kind("Late", name) == "none"
+                falkordb_client.select_graph(name).query("CREATE (:Late {x: 1})")
+                assert backend.label_kind("Late", name) == "none"
+            assert (
+                backend.label_kind("Late", name) == "node"
+            )  # the next snapshot sees it
+        finally:
+            with suppress(ResponseError):
+                falkordb_client.select_graph(name).delete()
 
     def test_nothing_survives_the_snapshot(
         self, falkordb_client, db_name, count_queries
