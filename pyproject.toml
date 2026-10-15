@@ -4,12 +4,12 @@ build-backend = "uv_build"
 
 [project]
 name = "OpenCyVer"
-version = "3.0.0"
-description = "Cypher queries Validators against a given FalkorDB Knowledge Graph schema, in terms of syntax, schema validity, and property access."
+version = "3.0.1"
+description = "Cypher query validator against a given FalkorDB Knowledge Graph schema, in terms of syntax, schema validity, and property access."
 readme = "README.md"
-authors = [{ name = "Kwaku Yeboah-Antwi", email = "kwaku@kwaku.is" },
-        { name = "Ioanna Mandilara", email = "ioanna_mandilara@yahoo.gr" },
-        { name = "Christina-Maria Androna", email = "androna.xm@gmail.com" }]
+authors = [{ name = "Kwaku Yeboah-Antwi" },
+        { name = "Ioanna Mandilara" },
+        { name = "Christina-Maria Androna" }]
 dependencies = [
     "regex>=2024.11.6",
     "pandas>=2.2.3",
