@@ -1,0 +1,595 @@
+import regex as re
+
+from opencyver import patterns
+from opencyver.backend import (
+    UNKNOWN_INDEX,
+    UNKNOWN_LABEL,
+    UNKNOWN_REL_TYPE,
+    CypherError,
+    get_backend,
+    snapshotted,
+)
+from opencyver.utils import get_paths_after_inference, replace_with_labels
+
+# `(a)<-[r]-(b)` and `(a)-[r]->(b)`, matched on a path whose property maps were masked.
+# The relationship is optional so that `<--` and `-->` work too.
+_LEFT_POINTING = re.compile(
+    r"^(?P<left>\([^()]*\))\s*+<-\s*+(?P<rel>\[[^\[\]]*\])?\s*+-\s*+(?P<right>\([^()]*\))$"
+)
+_RIGHT_POINTING = re.compile(
+    r"^(?P<left>\([^()]*\))\s*+-\s*+(?P<rel>\[[^\[\]]*\])?\s*+->\s*+(?P<right>\([^()]*\))$"
+)
+
+
+def _reverse_direction(path):
+    """Flip the arrow of a one-hop path: ``(a)<-[r]-(b)`` becomes ``(a)-[r]->(b)`` and vice versa.
+
+    Property maps are masked first, so a ``-``, ``->`` or ``*`` inside a value cannot be mistaken
+    for part of the arrow.
+
+    Returns:
+        str | None: The flipped path, or None if ``path`` is not a single directed hop.
+    """
+    masked, properties = patterns.mask_properties(path.strip())
+    if match := _LEFT_POINTING.match(masked):
+        flipped = f"{match['left']}-{match['rel'] or ''}->{match['right']}"
+    elif match := _RIGHT_POINTING.match(masked):
+        flipped = f"{match['left']}<-{match['rel'] or ''}-{match['right']}"
+    else:
+        return None
+    return patterns.unmask_properties(flipped, properties)
+
+
+def _zero_or_more_hops(path):
+    """Replace every ``*X..Y`` in ``path`` with ``*``; None if the path has no variable length.
+
+    A ``*`` inside a property value (``{note:'a*b'}``) is not a variable length and is left alone.
+    """
+    masked, properties = patterns.mask_properties(path)
+    if "*" not in masked:
+        return None
+    return patterns.unmask_properties(
+        patterns.VARIABLE_LENGTH.sub("*", masked), properties
+    )
+
+
+class SchemaValidator:
+    """
+    A class to validate Cypher queries against the schema of a graph.
+
+    A query is valid if the node labels, relationship types and one-hop paths it uses exist in the graph
+    (with the direction written in the query), and so do the indexes behind the full-text and vector
+    index query procedures it calls. Labels and types that the query leaves out are inferred from the graph.
+    """
+
+    def __init__(self, driver):
+        """
+        Initialize the validator with a FalkorDB client.
+
+        Args:
+            driver: A ``falkordb.FalkorDB`` client (or FalkorDBLite), or a ``falkordb.Graph``.
+                ``database_name`` is the graph name (optional when a ``falkordb.Graph`` is given).
+
+        Raises:
+            TypeError: If the driver is not a FalkorDB client or graph.
+        """
+        self.driver = driver
+        self.backend = get_backend(driver)
+
+    def __get_path_exists(self, path, database_name):
+        """Whether the pattern matches anything in the graph, and the warnings about unknown labels and types."""
+        return self.backend.path_exists(path, database_name)
+
+    def __check_path_exists(self, pattern, original_path_map, database_name=None):
+        """
+        Check if the provided pattern exists in the graph database
+
+        Args:
+            pattern (str): A node, a relationship or a one-hop path, e.g. ``(:Goal)``.
+            original_path_map (dict | None): For each extracted path, the paths as written in the query. None for a node or relationship.
+            database_name (str | None): The graph to validate the query against. None (default) uses the graph the validator was given.
+
+        Returns:
+            - bool: True if the pattern exists , False otherwise.
+            - metadata (list[dict]): Warnings about unknown labels and relationship types
+                ('OpenCyVer.Warning.UnknownLabel', 'OpenCyVer.Warning.UnknownRelationshipType'), or about why a path does
+                not exist (wrong direction, variable length, unknown path).
+                Each dictionary includes:
+                - 'code' (str): The error or warning code.
+                - 'description' (str): A detailed message describing the issue.
+        """
+        metadata = []  # the warnings found
+        try:
+            pattern_exists, notifications = self.__get_path_exists(
+                pattern, database_name
+            )
+
+            # Keep the warnings about unknown labels and relationship types, without duplicates
+            for notification in notifications or []:
+                if notification["code"] in (
+                    UNKNOWN_LABEL,
+                    UNKNOWN_REL_TYPE,
+                ) and not any(
+                    item["code"] == notification["code"]
+                    and item["description"] == notification["description"]
+                    for item in metadata
+                ):
+                    metadata.append(
+                        {
+                            "code": notification["code"],
+                            "description": notification["description"],
+                        }
+                    )
+
+            # An unknown label or type already explains why the pattern does not exist
+            if not pattern_exists and not metadata:
+                # Every label and type is known, so the pattern simply does not exist. Only a path can be
+                # explained (wrong direction, ...); a node or relationship is just reported as missing.
+                original_paths = (original_path_map or {}).get(pattern, [])
+                self.__diagnose_missing_path(
+                    pattern, original_paths, database_name, metadata
+                )
+            return pattern_exists, metadata
+        except CypherError:
+            # The pattern cannot be executed (syntax or execution error), so it does not exist
+            return False, metadata
+
+    def __diagnose_missing_path(self, pattern, original_paths, database_name, metadata):
+        """
+        Explain why a path whose labels and relationship types are all valid does not exist, and append the
+        explanations to ``metadata``. In order of preference the cause is:
+
+        1. VariableLengthPathWarning: it exists once the `*X..Y` of the original path is replaced by `*`
+        2. WrongDirectionPathWarning: it exists with the opposite direction
+        3. WrongDirectionPath&VariableLengthPathWarning: it exists with the opposite direction and `*`
+        4. UnknownPathWarning: none of the above
+
+        Args:
+            pattern (str): The extracted path (labels and types only) that does not exist.
+            original_paths (list[str]): The paths in the query the pattern was extracted from.
+            database_name (str | None): Database to check against.
+            metadata (list[dict]): Receives one warning per original path.
+        """
+        shown = self.__replace_variables_with_empty_string(pattern)
+        # The same path without its arrows, or '' if the path has no direction
+        undirected = (
+            pattern.replace("->", "-").replace("<-", "-")
+            if "->" in pattern or "<-" in pattern
+            else ""
+        )
+
+        for original in original_paths:
+            unknown = {
+                "code": "UnknownPathWarning",
+                "description": f"The specified path {shown} does not exist in the knowledge graph schema. The path {original} in the Cypher statement is wrong.",
+            }
+            any_hops = _zero_or_more_hops(original)
+
+            if (
+                any_hops is not None
+                and self.__get_path_exists(any_hops, database_name)[0]
+            ):
+                metadata.append(
+                    {
+                        "code": "VariableLengthPathWarning",
+                        "description": f"The specified path {shown} does not exist in the knowledge graph schema. The path {original} in the Cypher statement should be changed to {any_hops}.",
+                    }
+                )
+            elif not undirected:
+                metadata.append(unknown)
+            elif self.__get_path_exists(undirected, database_name)[0]:
+                # It only exists the other way round
+                flipped = _reverse_direction(original)
+                if flipped is None:
+                    metadata.append(unknown)
+                else:
+                    metadata.append(
+                        {
+                            "code": "WrongDirectionPathWarning",
+                            "description": f"The specified path {shown} has the opposite direction in the knowledge graph schema. The path {original} in the Cypher statement should be changed to  {flipped}.",
+                        }
+                    )
+            else:
+                flipped = _reverse_direction(original)
+                flipped_any_hops = _zero_or_more_hops(flipped) if flipped else None
+                if (
+                    flipped_any_hops is not None
+                    and self.__get_path_exists(flipped_any_hops, database_name)[0]
+                ):
+                    metadata.append(
+                        {
+                            "code": "WrongDirectionPath&VariableLengthPathWarning",
+                            "description": f"The specified path {shown} does not exist in the knowledge graph schema. The path {original} in the Cypher statement should be changed to {flipped_any_hops}.",
+                        }
+                    )
+                else:
+                    metadata.append(unknown)
+
+    def __extract_internal(self, query, database_name=None):
+        """
+        Extract the node labels, relationship types and one-hop paths of the provided query. Any properties mentioned are stripped.
+
+        Args:
+            query (str): The Cypher query to validate.
+            database_name (str | None): The graph to validate the query against. None (default) uses the graph the validator was given.
+
+        Returns:
+            tuple: Four items:
+            - the nodes, e.g. ``(:Goal)``;
+            - the relationships, e.g. ``()-[:HAS_TARGET]-()``;
+            - the one-hop paths, with the labels and types inferred where the query leaves them out;
+            - a dict: each extracted path -> the list of paths as written in the query.
+        """
+
+        # The extracted path -> the paths as written in the query that give it
+        original_path_map = {}
+        # A path that needs inference -> the same path after inference
+        inference_path_map = {}
+
+        ################### Original paths ##################################
+        # Extract the paths as it is in the query (original paths)
+        matches_original = patterns.PATH_ORIGINAL.findall(query, overlapped=True)
+
+        ################## Edited paths #####################################
+        # Replace -- with empty relationship to infer the hidden relationship
+        query = query.replace("--", "-[]-")
+
+        # Replace () with (unknown variables)
+        query = self.__replace_bracket_placeholders(query)
+
+        # Extract paths
+        matches = patterns.PATH_EDITED.findall(query, overlapped=True)
+
+        # Extract the nodes and relationships that have a label or type (even when they also have properties)
+        nodes_matches = patterns.LABELED_NODE.findall(query)
+        rels_matches = patterns.LABELED_REL.findall(query)
+
+        # Dict of key the variables in query and value the label of the rel or node
+        nodes_dict = {
+            key.strip() or f"_empty_{i}": value.strip()
+            for i, (key, value) in enumerate(
+                match[0].split(":", 1) for match in nodes_matches
+            )
+        }
+        rels_dict = {
+            key.strip() or f"_empty_{i}": value.strip()
+            for i, (key, value) in enumerate(
+                match[0].split(":", 1) for match in rels_matches
+            )
+        }
+        # The label or type of an index query (CALL db.idx.fulltext.queryNodes('Label', ...)) is in no pattern
+        index_calls = patterns.index_procedure_calls(query)
+        for index, call in enumerate(index_calls):
+            (nodes_dict if call.on == "nodes" else rels_dict)[f"_index_{index}"] = (
+                call.label
+            )
+        elements_dict = {**nodes_dict, **rels_dict}
+
+        # The nodes labels
+        node_labels = sorted(set(nodes_dict.values()))
+        node_paths = ["(:" + node_label + ")" for node_label in node_labels]
+
+        # The rels labels
+        rel_labels = sorted(set(rels_dict.values()))
+        # Delete everything after * if exists
+        rel_paths = sorted(
+            {
+                "()-[:" + re.sub(r"\*.*", "", rel_label) + "]-()"
+                for rel_label in rel_labels
+            }
+        )
+
+        # If we have at least one path in the cypher query
+        if matches:
+            # A set containing the paths for inference
+            inference_paths, paths = set(), set()
+
+            # Stage 1: Give variables the labels the query gives them elsewhere, remove {properties} and find the paths to infer
+            for index, match in enumerate(matches):
+                # Step 1: Delete extra spaces
+                path = re.sub(r"\s+", "", match)
+
+                # Step 2: Delete {} properties inside nodes and rels
+                match_wt_prop = re.sub(r"\{[^}]*\}", "", path)
+
+                # Step 3: Add labels to variables if specified in another match clause
+                path_with_node_rels_labels = replace_with_labels(
+                    match_wt_prop, elements_dict
+                )  # replace i to i:Indicator
+
+                # Step 4: Remove prefix before colon to the edited path
+                edited_path = self.__remove_prefix_before_colon(
+                    path_with_node_rels_labels
+                )
+
+                # Step 5: Inference - Find variables in relationships or nodes
+                if any(
+                    filter(
+                        None,
+                        re.findall(r"\((\w+)\)|\[(\w+)\]", path_with_node_rels_labels),
+                    )
+                ):
+                    # add to inference paths
+                    inference_paths.add(edited_path)
+                    # keep a mapping before and after inference
+                    inference_path_map[edited_path] = ""
+
+                # Step 6: Add the edited path to paths
+                paths.add(edited_path)
+
+                # Step 7: Map the edited path to the original paths it comes from (several can give the same one)
+                original_path_map.setdefault(edited_path, []).append(
+                    matches_original[index]
+                )
+
+                # Step 8: The paths that need no inference
+                not_inference_paths = paths - inference_paths
+
+            # Stage 2: Inference time!
+            if inference_paths:
+                # Copy not inference paths to combine them
+                paths_after_inference = not_inference_paths.copy()
+                # variable -> its inferred label or type ("" if none was found)
+                inference_dict = {}
+                for df in get_paths_after_inference(
+                    self.backend, sorted(inference_paths), database_name
+                ):
+                    if df.empty:
+                        for col in df.columns:
+                            inference_dict[col] = ""
+                    else:
+                        # Every row is a label combination that exists in the graph, so any of them
+                        # will do. Take the first alphabetically so the result is reproducible.
+                        first_combination = df.sort_values(list(df.columns)).iloc[0]
+                        for col in df.columns:
+                            inference_dict[col] = first_combination[col]
+                # Loop over the inference paths to replace with labels
+                for inference_match in inference_paths:
+                    inferenced_path = self.__remove_prefix_before_colon(
+                        replace_with_labels(inference_match, inference_dict)
+                    )
+                    paths_after_inference.add(inferenced_path)
+                    # update the mapping dict before and after inference of the path
+                    inference_path_map[inference_match] = inferenced_path
+
+                # Update original_path_map to map the original path to the inferenced path
+                updated_original_path_map = {}
+                for modified_path, original_paths in original_path_map.items():
+                    # If the edited/modified path is a path that needs to be inferenced then:
+                    if modified_path in inference_path_map:
+                        # get the modified inferenced path as key and value the original paths
+                        updated_original_path_map[inference_path_map[modified_path]] = (
+                            original_paths
+                        )
+                    else:
+                        # otherwise, add as key the modified path and value the original paths
+                        updated_original_path_map[modified_path] = original_paths
+
+                # Replace the old mapping with the updated one
+                original_path_map = updated_original_path_map
+                return (
+                    node_paths,
+                    rel_paths,
+                    sorted(paths_after_inference),
+                    original_path_map,
+                )
+            return node_paths, rel_paths, sorted(paths), original_path_map
+        else:
+            # Without a path a relationship type can only come from an index query procedure
+            index_rel_paths = sorted(
+                {f"()-[:{call.label}]-()" for call in index_calls if call.on != "nodes"}
+            )
+            return node_paths, index_rel_paths, [], original_path_map
+
+    @snapshotted
+    def extract(self, query, database_name=None):
+        """
+        Extract the node labels, relationship types and one-hop paths of the provided query. Any properties mentioned are stripped.
+
+        Args:
+            query (str): The Cypher query to validate.
+            database_name (str | None) :Database to validate the query against. None (default) uses the database configured on the server side.
+
+        Returns:
+            Three lists: the nodes, the relationships and the one-hop paths of the query, with properties and variables removed.
+        """
+        self.backend.check_database(database_name)
+        nodes, rels, paths, _ = self.__extract_internal(query, database_name)
+        paths = [self.__replace_variables_with_empty_string(path) for path in paths]
+        return nodes, rels, paths
+
+    @snapshotted
+    def validate(self, query, database_name=None):
+        """
+        Validate the correctness of the nodes, relationships and paths of the provided query
+
+        Args:
+            query (str): The Cypher query to validate.
+            database_name (str | None): The graph to validate the query against. None (default) uses the graph the validator was given.
+
+        Returns:
+            tuple: ``(score, metadata)``.
+
+            score (float): In [0, 1]. The average of the share of the query's nodes that exist, the share of its
+            relationships that exist and the share of its paths that exist (a kind the query does not use is left
+            out; a query with none of them scores 1). If the query calls a full-text or vector index procedure
+            (``db.idx.fulltext.query...``, ``db.idx.vector.query...``) the score is then averaged with the share
+            of those calls that have an index.
+
+            metadata (list[dict]): The problems found, without duplicates. Each dictionary includes:
+            - 'code' (str): ``OpenCyVer.Warning.UnknownLabel``, ``OpenCyVer.Warning.UnknownRelationshipType``,
+              ``OpenCyVer.Warning.UnknownIndex``, or ``UnknownPathWarning``, ``WrongDirectionPathWarning``,
+              ``VariableLengthPathWarning`` or ``WrongDirectionPath&VariableLengthPathWarning`` for a path that does not exist.
+            - 'description' (str): A detailed message describing the issue.
+        """
+        self.backend.check_database(database_name)
+        # The node labels, the relationship types and the one-hop paths of the query (with inferred labels and types),
+        # and the mapping of each extracted path to the paths as written in the query
+        nodes, rels, paths, original_path_map = self.__extract_internal(
+            query, database_name
+        )
+
+        # The distinct notifications, in the order they were found (a dict is an ordered set)
+        metadata = {}
+
+        if nodes:
+            common_nodes = 0
+            for node in nodes:
+                node_exists, node_notifications = self.__check_path_exists(
+                    node, None, database_name
+                )
+                common_nodes += int(
+                    node_exists
+                )  # Convert boolean to integer and sum it
+                if node_notifications:
+                    # OpenCyVer.Warning.UnknownLabel
+                    metadata.update(
+                        dict.fromkeys(tuple(n.items()) for n in node_notifications)
+                    )
+        if rels:
+            common_rels = 0
+            for rel in rels:
+                rel_exists, rel_notifications = self.__check_path_exists(
+                    rel, None, database_name
+                )
+                common_rels += int(rel_exists)
+                if rel_notifications:
+                    # OpenCyVer.Warning.UnknownRelationshipType
+                    metadata.update(
+                        dict.fromkeys(tuple(n.items()) for n in rel_notifications)
+                    )
+        if paths:
+            common_paths = 0
+            for path in paths:
+                path_exists, path_notifications = self.__check_path_exists(
+                    path, original_path_map, database_name
+                )
+                common_paths += int(path_exists)
+                if path_notifications:
+                    # OpenCyVer.Warning.UnknownLabel
+                    # OpenCyVer.Warning.UnknownRelationshipType
+                    metadata.update(
+                        dict.fromkeys(tuple(n.items()) for n in path_notifications)
+                    )
+
+        # The label of an index query procedure exists, but does an index back the call?
+        index_calls = list(
+            dict.fromkeys(
+                call._replace(variable=None)
+                for call in patterns.index_procedure_calls(query)
+            )
+        )
+        indexed = 0
+        for call in index_calls:
+            if self.backend.index_exists(
+                call.index, call.on, call.label, call.attribute, database_name
+            ):
+                indexed += 1
+            else:
+                metadata[tuple(self.__missing_index(call).items())] = None
+
+        # Convert to list
+        metadata = [dict(items) for items in metadata]
+        # The score: the average of the shares of the nodes, relationships and paths that exist
+        if paths:
+            if nodes:
+                if rels:
+                    score = (
+                        1 / 3 * ((common_rels) / len(rels))
+                        + 1 / 3 * ((common_nodes) / len(nodes))
+                        + 1 / 3 * ((common_paths) / len(paths))
+                    )
+
+                else:
+                    score = 0.5 * ((common_nodes) / len(nodes)) + 0.5 * (
+                        (common_paths) / len(paths)
+                    )
+
+            else:
+                if rels:
+                    score = 0.5 * ((common_rels) / len(rels)) + 0.5 * (
+                        (common_paths) / len(paths)
+                    )
+                else:
+                    score = (common_paths) / len(paths)
+        else:
+            # No paths: the labels, and the relationship types of index query procedures
+            parts = []
+            if nodes:
+                parts.append(common_nodes / len(nodes))
+            if rels:
+                parts.append(common_rels / len(rels))
+            # nothing to check: a query such as MATCH (n)
+            score = sum(parts) / len(parts) if parts else 1
+
+        if index_calls:
+            # The index calls weigh as much as everything else in the query together
+            score = (score + indexed / len(index_calls)) / 2
+
+        return score, metadata
+
+    @staticmethod
+    def __missing_index(call):
+        """The warning for a call of a full-text or vector query procedure that has no index."""
+        target = "label" if call.on == "nodes" else "relationship type"
+        index = f"{call.index} index on the {target} {call.label}"
+        if call.attribute:
+            index += f", attribute {call.attribute}"
+        return {
+            "code": UNKNOWN_INDEX,
+            "description": f"The query needs a {index}, but the graph has none. FalkorDB answers a full-text "
+            "query without an index with an empty result, and a vector query with an error.",
+        }
+
+    @staticmethod
+    def __remove_prefix_before_colon(txt):
+        """Remove the variable before the colon in nodes and relationships: ``(a:Goal)`` becomes ``(:Goal)``.
+
+        Args:
+            txt (str): A path or pattern.
+
+        Returns:
+            str: ``txt`` without the variables that precede a label or type.
+        """
+        return re.sub(r"\b\w+:(\w*)", r":\1", txt)
+
+    @staticmethod
+    def __replace_bracket_placeholders(query):
+        """Give each empty relationship ``-[]-`` in the query a variable: ``-[var_1]-``, ``-[var_2]-``, ...
+
+        The variable lets the type of the relationship be inferred. An empty node ``()`` between two
+        dashes is treated the same way.
+        """
+        counter = [0]  # a list, so that the inner function can change it
+
+        pattern = re.compile(
+            r"""
+            (\<\s*-|-|-\s*>)       # group 1: left arrow or dash
+            \s*           # optional spaces
+            ([\(\[])\s*   # group 2: opening bracket ( or [
+            \s*           # optional spaces
+            ([\)\]])      # group 3: closing bracket ) or ]
+            \s*           # optional spaces
+            (-\s*>|-|<\s*-)        # group 4: right arrow or dash
+        """,
+            re.VERBOSE,
+        )
+
+        def replacer(match):
+            counter[0] += 1
+            left = match.group(1)
+            open_bracket = match.group(2)
+            close_bracket = match.group(3)
+            right = match.group(4)
+            return f"{left}{open_bracket}var_{counter[0]}{close_bracket}{right}"
+
+        return pattern.sub(replacer, query)
+
+    @staticmethod
+    def __replace_variables_with_empty_string(pattern):
+        """Remove the bare variables left after inference: ``(a)-[r:HAS]->(b)`` becomes ``()-[r:HAS]->()``."""
+        return re.sub(
+            r"\(\s*\w+\s*\)|\[\s*\w+\s*\]",
+            lambda m: "()" if m.group(0).startswith("(") else "[]",
+            pattern,
+        )
