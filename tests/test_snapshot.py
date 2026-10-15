@@ -53,6 +53,15 @@ class TestSnapshotSemantics:
             )  # same db.labels() answer
         assert calls["n"] == 1
 
+    def test_a_graph_that_does_not_exist_is_asked_about_once_per_schema_lookup(
+        self, falkordb_client, count_queries
+    ):
+        backend = get_backend(falkordb_client)
+        with count_queries() as calls, backend.snapshot():
+            for label in ("A", "B", "C"):
+                assert backend.label_kind(label, "no_such_graph") == "none"
+        assert calls["n"] == 2  # db.labels() and db.relationshipTypes(), once each
+
     def test_nothing_survives_the_snapshot(
         self, falkordb_client, db_name, count_queries
     ):

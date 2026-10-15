@@ -16,6 +16,8 @@ from opencyver._io import (
     AsyncTransport,
     Explain,
     Many,
+    Recall,
+    Remember,
     RoQuery,
     SyncTransport,
     run_async,
@@ -232,6 +234,34 @@ def test_a_snapshot_is_private_to_its_thread():
         worker.start()
         worker.join()
     assert transport.calls == [A, A, A]
+
+
+# ------------------------------------------------------------- remembered values
+def test_a_remembered_value_is_recalled_until_the_snapshot_ends(mode):
+    transport, run = mode
+    with snapshot(transport):
+        assert run(asks(Recall(("k",))), transport) == [None]
+        run(asks(Remember(("k",), frozenset())), transport)
+        # an empty value is still a value
+        assert run(asks(Recall(("k",)), Recall(("other",))), transport) == [
+            frozenset(),
+            None,
+        ]
+    assert run(asks(Recall(("k",))), transport) == [None]
+    assert transport.calls == []  # they never reach the database
+
+
+def test_nothing_is_remembered_outside_a_snapshot(mode):
+    transport, run = mode
+    run(asks(Remember(("k",), 1)), transport)
+    assert run(asks(Recall(("k",))), transport) == [None]
+
+
+def test_a_remembered_value_does_not_clash_with_an_answer(mode):
+    transport, run = mode
+    with snapshot(transport):
+        run(asks(Remember((A,), "mine"), A), transport)
+        assert run(asks(Recall((A,)), A), transport) == ["mine", "answer to A"]
 
 
 # ------------------------------------------------------------- async: concurrency
