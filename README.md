@@ -23,6 +23,7 @@
 * **Syntax Validation**: Validates Cypher queries for correct syntax and detects conflicting labels in nodes and relationships.
 * **Schema Validation**: Checks query alignment with a predefined KG schema structure.
 * **Property Validation**: Ensures property accesses are correct based on the predefined KG schema structure.
+* **Sync and async**: every validator has an async twin for the `falkordb.asyncio` client, with the same arguments and results (see [Async usage](#async-usage)).
 
 ### New Feature in release v2.x:
 
@@ -149,6 +150,41 @@ print(f"Properties Validation Score: {props_score}")
 print(f"Properties Validation Metadata: {properties_metadata}")
 
 ```
+
+### Async usage
+
+Each validator has an async twin for the `falkordb.asyncio` client: `AsyncSyntaxValidator`, `AsyncSchemaValidator` and `AsyncPropertiesValidator`. They take the same arguments and return the same results as the sync validators; their `validate()` and `extract()` are coroutines.
+
+```sh
+import asyncio
+from falkordb.asyncio import FalkorDB
+from opencyver import AsyncSchemaValidator
+
+async def main():
+    driver = FalkorDB(host='localhost', port=6379)
+    try:
+        schema_validator = AsyncSchemaValidator(driver, max_concurrency=8)
+        query = 'MATCH (g:Goal)-[:HAS_TARGET]->(t:Target) RETURN g, t'
+        schema_score, schema_metadata = await schema_validator.validate(query, database_name='my_graph')
+        print(f"Schema Validation Score: {schema_score}")
+    finally:
+        await driver.aclose()
+
+asyncio.run(main())
+```
+
+* **One implementation.** The sync and the async validators run the same validation logic, so they give identical results and make the same requests to the database.
+* **Pass an async client.** `driver` is a `falkordb.asyncio.FalkorDB` client or one of its graphs (then `database_name` can be omitted). The sync validators refuse an async client, and the async validators a sync one, with an error that names the right classes.
+* **`max_concurrency`** (default 8) is the most requests the validator has in flight at once on its connection. It must be at least 1.
+* **One client per event loop.** The async FalkorDB client is bound to the event loop that first used it, so create it, and the validators that use it, inside the loop that runs them.
+* **Validating many queries together** shares their schema lookups when you run them inside a snapshot. Each lookup (is this a label? does it have this property?) is then asked once, even by queries running at the same time, and nothing is kept after the block ends:
+
+  ```sh
+  validator = AsyncSchemaValidator(driver)
+  with validator.backend.snapshot():
+      results = await asyncio.gather(*(validator.validate(q, database_name) for q in queries))
+  ```
+* **Timeouts and cancellation work.** `await asyncio.wait_for(validator.validate(query, database_name), timeout=5)` cancels the queries it started when it times out, which frees their `max_concurrency` slots for the next call.
 
 ## 📊 **Tip:**
 
