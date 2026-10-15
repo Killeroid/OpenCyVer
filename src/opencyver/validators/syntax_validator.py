@@ -1,7 +1,11 @@
 from collections import defaultdict
+from collections.abc import Generator
+from typing import Any
 
 import regex as re
 
+from opencyver import _queries
+from opencyver._io import Request
 from opencyver.backend import (
     ARITHMETIC_ERROR,
     PARAMETER_NOT_PROVIDED,
@@ -11,10 +15,8 @@ from opencyver.backend import (
 from opencyver.patterns import strip_literals_and_comments
 
 
-class SyntaxValidator:
-    """
-    A class to validate Cypher queries for correct syntax and label consistency.
-    """
+class _SyntaxLogic:
+    """The logic of SyntaxValidator, as generators (see ``opencyver._io``): one copy for the sync and the async validator."""
 
     def __init__(self, driver, check_multilabeled_nodes=True):
         """
@@ -36,45 +38,27 @@ class SyntaxValidator:
         self.multilabels = None
         self._multilabels_by_database = {}
 
-    def __get_multilabels(self, database_name):
+    def __get_multilabels(self, database_name, graph) -> Generator[Request, Any, list]:
         """Fetch (and cache per database) the label combinations that occur together on a node."""
         if database_name not in self._multilabels_by_database:
             query = "MATCH (n) WHERE size(labels(n)) > 1 WITH DISTINCT labels(n) AS labelList RETURN COLLECT(labelList) AS output"
-            records = self.backend.execute(query, database_name)
+            records = yield from _queries.execute(graph, query)
             self._multilabels_by_database[database_name] = (
                 records[0]["output"] if records else []
             )
         self.multilabels = self._multilabels_by_database[database_name]
         return self.multilabels
 
-    def validate(self, query, database_name=None):
-        """
-        Checks if the query has correct Cypher syntax.
-        It detects these errors and warnings:
-        - FalkorDB.DatabaseError.Statement.ExecutionFailed: Raised when the database was unable to execute the statement.
-        - FalkorDB.ClientError.Statement.SyntaxError: Raised when the provided statement has invalid syntax.
-        - OpenCyVer.Warning.ParameterNotProvided: Raised when a parameter is not provided.
-        - OpenCyVer.Error.ArithmeticError: Raised when an arithmetic error occurs during query execution due to explicit division by zero ("/0", "/0.0" , "/(0)"),
-        but not when arithmetic errors may occur at execution time when a divisor becomes zero as part of dynamic execution.
-        - ConflictingVariablesError: Raised when a variable is given different labels (unless they are labels that occur together on a node, see ``check_multilabeled_nodes``).
-
-        Args:
-            query (str): The Cypher query to validate.
-            database_name (str | None): The graph to validate the query against (optional when a ``falkordb.Graph`` was given).
-
-        Returns:
-            bool: True if the syntax is correct, False otherwise.
-            metadata (list[dict]): The errors and warnings found, empty if there are none.
-                Each dictionary includes:
-                - 'code' (str): The error or warning code.
-                - 'description' (str): A detailed message describing the issue.
-        """
-        self.backend.check_database(database_name)
+    def _validate(
+        self, query, database_name=None
+    ) -> Generator[Request, Any, tuple[bool, list[dict]]]:
+        """The logic of ``validate``, as a generator."""
+        graph = self.backend._graph_name(database_name)
         metadata = []  # the errors and warnings found
 
         try:
             # Check the query plan without executing the query (GRAPH.EXPLAIN)
-            notifications = self.backend.explain(query, database_name)
+            notifications = yield from _queries.explain(graph, query)
 
             # EXPLAIN does not execute the query, so the one warning it gives is a missing $parameter
             if notifications:
@@ -118,7 +102,7 @@ class SyntaxValidator:
             # labels at once (e.g. GeoArea and Area), so with check_multilabeled_nodes the labels that occur
             # together on a node in the graph are not a conflict.
             if self.check_multilabeled_nodes:
-                multilabels = self.__get_multilabels(database_name)
+                multilabels = yield from self.__get_multilabels(database_name, graph)
                 conflicting_vars = {
                     var: labels
                     for var, labels in variable_labels.items()
@@ -175,3 +159,33 @@ class SyntaxValidator:
             if all(item in inner_list for item in subset):
                 return True
         return False
+
+
+class SyntaxValidator(_SyntaxLogic):
+    """
+    A class to validate Cypher queries for correct syntax and label consistency.
+    """
+
+    def validate(self, query, database_name=None):
+        """
+        Checks if the query has correct Cypher syntax.
+        It detects these errors and warnings:
+        - FalkorDB.DatabaseError.Statement.ExecutionFailed: Raised when the database was unable to execute the statement.
+        - FalkorDB.ClientError.Statement.SyntaxError: Raised when the provided statement has invalid syntax.
+        - OpenCyVer.Warning.ParameterNotProvided: Raised when a parameter is not provided.
+        - OpenCyVer.Error.ArithmeticError: Raised when an arithmetic error occurs during query execution due to explicit division by zero ("/0", "/0.0" , "/(0)"),
+        but not when arithmetic errors may occur at execution time when a divisor becomes zero as part of dynamic execution.
+        - ConflictingVariablesError: Raised when a variable is given different labels (unless they are labels that occur together on a node, see ``check_multilabeled_nodes``).
+
+        Args:
+            query (str): The Cypher query to validate.
+            database_name (str | None): The graph to validate the query against (optional when a ``falkordb.Graph`` was given).
+
+        Returns:
+            bool: True if the syntax is correct, False otherwise.
+            metadata (list[dict]): The errors and warnings found, empty if there are none.
+                Each dictionary includes:
+                - 'code' (str): The error or warning code.
+                - 'description' (str): A detailed message describing the issue.
+        """
+        return self.backend.run(self._validate(query, database_name))
