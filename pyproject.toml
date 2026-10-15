@@ -1,0 +1,53 @@
+[build-system]
+requires = ["uv_build>=0.13.0,<0.14"]
+build-backend = "uv_build"
+
+[project]
+name = "OpenCyVer"
+version = "3.0.0"
+description = "Cypher queries Validators against a given FalkorDB Knowledge Graph schema, in terms of syntax, schema validity, and property access."
+readme = "README.md"
+authors = [{ name = "Ioanna Mandilara", email = "ioanna_mandilara@yahoo.gr" },
+        { name = "Christina-Maria Androna", email = "androna.xm@gmail.com" }]
+dependencies = [
+    "regex>=2024.11.6",
+    "pandas>=2.2.3",
+    "falkordb>=1.8.0",
+]
+requires-python = ">=3.10"
+classifiers=[
+        'Programming Language :: Python :: 3',
+        'Operating System :: OS Independent',
+]
+license = { file = "LICENSE" }  # Reference the LICENSE file here
+
+
+[tool.uv.build-backend]
+module-name = "opencyver"
+
+[dependency-groups]
+dev = [
+    "falkordblite; python_version >= '3.12'",
+    "pytest>=9.1.1",
+    "ruff>=0.17.0",
+    "ty>=0.0.87",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+src = ["src"]
+
+[tool.ruff.lint]
+extend-select = ["B", "I", "UP"]
+
+[tool.ty.environment]
+python = ".venv"
+
+[project.urls]
+Homepage = "https://github.com/Killeroid/OpenCyVer"
+Documentation = "https://github.com/Killeroid/OpenCyVer/tree/main/docs"
+Changelog = "https://github.com/Killeroid/OpenCyVer/blob/main/CHANGELOG.md"
+Issues = "https://github.com/Killeroid/OpenCyVer/issues"
+Repository = "https://github.com/Killeroid/OpenCyVer"
