@@ -10,6 +10,7 @@ from opencyver.backend import (
     ARITHMETIC_ERROR,
     PARAMETER_NOT_PROVIDED,
     CypherError,
+    get_async_backend,
     get_backend,
 )
 from opencyver.patterns import strip_literals_and_comments
@@ -31,12 +32,16 @@ class _SyntaxValidator:
             TypeError: If the driver is not a FalkorDB client or graph.
         """
         self.driver = driver
-        self.backend = get_backend(driver)
+        self.backend = self._open_backend(driver)
 
         # Multilabel nodes, fetched lazily per database the first time validate() needs them
         self.check_multilabeled_nodes = check_multilabeled_nodes
         self.multilabels = None
         self._multilabels_by_database = {}
+
+    def _open_backend(self, driver):
+        """The backend the validator runs on. The async validators override this."""
+        return get_backend(driver)
 
     def __get_multilabels(self, database_name, graph) -> Generator[Request, Any, list]:
         """Fetch (and cache per database) the label combinations that occur together on a node."""
@@ -189,3 +194,31 @@ class SyntaxValidator(_SyntaxValidator):
                 - 'description' (str): A detailed message describing the issue.
         """
         return self.backend.run(self._validate(query, database_name))
+
+
+class AsyncSyntaxValidator(_SyntaxValidator):
+    """The async version of :class:`SyntaxValidator`, for a ``falkordb.asyncio`` client or graph: ``validate`` is a coroutine."""
+
+    def __init__(self, driver, check_multilabeled_nodes=True, max_concurrency=8):
+        """
+        Initialize the validator with an async FalkorDB client.
+
+        Args:
+            driver: A ``falkordb.asyncio.FalkorDB`` client, or one of its graphs.
+                ``database_name`` is the graph name (optional when a graph is given).
+            check_multilabeled_nodes (bool): Whether to check for multilabeled nodes (default: True).
+            max_concurrency (int): The most requests in flight at once on this validator's connection.
+
+        Raises:
+            TypeError: If the driver is not an async FalkorDB client or graph.
+            ValueError: If ``max_concurrency`` is less than 1.
+        """
+        self._max_concurrency = max_concurrency
+        super().__init__(driver, check_multilabeled_nodes)
+
+    def _open_backend(self, driver):
+        return get_async_backend(driver, self._max_concurrency)
+
+    async def validate(self, query, database_name=None):
+        """The async version of :meth:`SyntaxValidator.validate`: the same arguments and result."""
+        return await self.backend.run(self._validate(query, database_name))

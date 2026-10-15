@@ -7,7 +7,7 @@ import regex as re
 
 from opencyver._io import Request
 from opencyver._queries import query_to_df
-from opencyver.backend import CypherError, get_backend
+from opencyver.backend import CypherError, get_async_backend, get_backend
 
 
 def identify_variables_and_construct_query(pattern):
@@ -110,6 +110,16 @@ def get_paths_after_inference(driver, all_paths_with_vars, database_name=None):
     backend = get_backend(driver)
     graph = backend._graph_name(database_name)
     return backend.run(paths_after_inference(graph, all_paths_with_vars))
+
+
+async def get_paths_after_inference_async(
+    driver, all_paths_with_vars, database_name=None
+):
+    """The async version of :func:`get_paths_after_inference`: ``driver`` is a ``falkordb.asyncio`` client or graph
+    (or an ``AsyncFalkorDBBackend``), and the DataFrames are awaited."""
+    backend = get_async_backend(driver)
+    graph = backend._graph_name(database_name)
+    return await backend.run(paths_after_inference(graph, all_paths_with_vars))
 
 
 def paths_after_inference(

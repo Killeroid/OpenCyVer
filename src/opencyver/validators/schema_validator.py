@@ -10,6 +10,8 @@ from opencyver.backend import (
     UNKNOWN_LABEL,
     UNKNOWN_REL_TYPE,
     CypherError,
+    async_snapshotted,
+    get_async_backend,
     get_backend,
     snapshotted,
 )
@@ -73,7 +75,11 @@ class _SchemaValidator:
             TypeError: If the driver is not a FalkorDB client or graph.
         """
         self.driver = driver
-        self.backend = get_backend(driver)
+        self.backend = self._open_backend(driver)
+
+    def _open_backend(self, driver):
+        """The backend the validator runs on. The async validators override this."""
+        return get_backend(driver)
 
     def __get_path_exists(
         self, path, database_name
@@ -629,3 +635,36 @@ class SchemaValidator(_SchemaValidator):
             - 'description' (str): A detailed message describing the issue.
         """
         return self.backend.run(self._validate(query, database_name))
+
+
+class AsyncSchemaValidator(_SchemaValidator):
+    """The async version of :class:`SchemaValidator`, for a ``falkordb.asyncio`` client or graph: ``extract`` and ``validate`` are coroutines."""
+
+    def __init__(self, driver, max_concurrency=8):
+        """
+        Initialize the validator with an async FalkorDB client.
+
+        Args:
+            driver: A ``falkordb.asyncio.FalkorDB`` client, or one of its graphs.
+                ``database_name`` is the graph name (optional when a graph is given).
+            max_concurrency (int): The most requests in flight at once on this validator's connection.
+
+        Raises:
+            TypeError: If the driver is not an async FalkorDB client or graph.
+            ValueError: If ``max_concurrency`` is less than 1.
+        """
+        self._max_concurrency = max_concurrency
+        super().__init__(driver)
+
+    def _open_backend(self, driver):
+        return get_async_backend(driver, self._max_concurrency)
+
+    @async_snapshotted
+    async def extract(self, query, database_name=None):
+        """The async version of :meth:`SchemaValidator.extract`: the same arguments and result."""
+        return await self.backend.run(self._extract(query, database_name))
+
+    @async_snapshotted
+    async def validate(self, query, database_name=None):
+        """The async version of :meth:`SchemaValidator.validate`: the same arguments and result."""
+        return await self.backend.run(self._validate(query, database_name))
