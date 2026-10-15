@@ -18,6 +18,10 @@ Requests are:
   ``max_concurrency`` at once). Either way every request runs, and then the first error, in request order, is
   thrown into the generator.
 
+* :class:`Remember` and :class:`Recall`: keep a value the logic worked out (such as "this graph has no schema
+  yet", which is not an answer the database gave) for the rest of the snapshot, and get it back. They never
+  reach the database.
+
 Inside :func:`snapshot` the answer to a request is kept, so asking the same thing twice costs one round-trip.
 """
 
@@ -52,6 +56,25 @@ class Many:
     """Requests (a tuple of :class:`RoQuery` / :class:`Explain`) that can be answered in any order."""
 
     requests: tuple
+
+
+@dataclass(frozen=True)
+class Remember:
+    """Keep ``value`` under ``key`` until the snapshot ends (nothing is kept outside a snapshot)."""
+
+    key: tuple
+    value: object
+
+
+@dataclass(frozen=True)
+class Recall:
+    """The value kept under ``key`` in this snapshot, or None if there is none."""
+
+    key: tuple
+
+
+# What a logic generator may yield
+Request = RoQuery | Explain | Many | Remember | Recall
 
 
 # ---------------------------------------------------------------------- snapshots
@@ -181,7 +204,17 @@ def run_sync(generator, transport):
                 error = e
 
 
+def _answer_remembered(request, answers):
+    """Answer a Remember or Recall from the snapshot. Its keys are tuples, so they never meet a request's."""
+    if isinstance(request, Recall):
+        return None if answers is None else answers.get(("remembered", request.key))
+    if answers is not None:
+        answers[("remembered", request.key)] = request.value
+
+
 def _answer_sync(request, transport, answers):
+    if isinstance(request, Remember | Recall):
+        return _answer_remembered(request, answers)
     if not isinstance(request, Many):
         return _answer_one_sync(request, transport, answers)
     results, first_error = [], None
@@ -229,6 +262,8 @@ async def run_async(generator, transport):
 
 
 async def _answer_async(request, transport, answers):
+    if isinstance(request, Remember | Recall):
+        return _answer_remembered(request, answers)
     if not isinstance(request, Many):
         return await _answer_one_async(request, transport, answers)
     outcomes = await asyncio.gather(

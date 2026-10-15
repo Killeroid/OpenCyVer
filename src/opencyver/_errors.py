@@ -1,8 +1,15 @@
-"""The error OpenCyVer raises when FalkorDB rejects a query, and the codes it is reported with.
+"""The codes OpenCyVer reports, and the error it raises when FalkorDB rejects a query.
 
-Kept apart from ``backend`` so the I/O layer (``_io``) can raise it without importing the backend.
+Kept apart from ``backend`` so the I/O layer (``_io``) and the query logic (``_queries``) can use them
+without importing the backend, which imports both.
 """
 
+# The codes OpenCyVer reports in its metadata. FalkorDB has no notifications of its own, so OpenCyVer produces these itself.
+UNKNOWN_LABEL = "OpenCyVer.Warning.UnknownLabel"
+UNKNOWN_REL_TYPE = "OpenCyVer.Warning.UnknownRelationshipType"
+UNKNOWN_PROPERTY = "OpenCyVer.Warning.UnknownPropertyKey"
+PARAMETER_NOT_PROVIDED = "OpenCyVer.Warning.ParameterNotProvided"
+UNKNOWN_INDEX = "OpenCyVer.Warning.UnknownIndex"
 # Errors raised by FalkorDB itself
 SYNTAX_ERROR = "FalkorDB.ClientError.Statement.SyntaxError"
 EXECUTION_FAILED = "FalkorDB.DatabaseError.Statement.ExecutionFailed"
