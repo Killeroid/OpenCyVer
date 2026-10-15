@@ -1,5 +1,7 @@
 """Fixtures: an embedded FalkorDB (FalkorDBLite) with small graphs the tests validate queries against."""
 
+import asyncio
+
 import pytest
 
 GRAPH_NAME = "kg"
@@ -80,3 +82,22 @@ def documents(falkordb_client):
     graph.query(f"CREATE VECTOR INDEX FOR ()-[c:CITES]-() ON (c.emb) {options}")
     yield "documents"
     graph.delete()
+
+
+@pytest.fixture
+def run_async(falkordb_client):
+    """``run_async(fn)``: await ``fn(client)`` on a ``falkordb.asyncio`` client, in a fresh event loop."""
+
+    from falkordb.asyncio import FalkorDB as AsyncFalkorDB
+
+    def run(fn):
+        async def main():
+            client = AsyncFalkorDB(unix_socket_path=falkordb_client.client.socket_file)
+            try:
+                return await fn(client)
+            finally:
+                await client.aclose()
+
+        return asyncio.run(main())
+
+    return run

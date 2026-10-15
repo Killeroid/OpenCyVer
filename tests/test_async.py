@@ -8,7 +8,6 @@ import asyncio
 
 import falkordb
 import pytest
-from falkordb.asyncio import FalkorDB as AsyncFalkorDB
 from falkordb.asyncio.graph import AsyncGraph
 
 from opencyver import (
@@ -78,23 +77,6 @@ VALIDATORS = {
         ["validate", "extract"],
     ),
 }
-
-
-@pytest.fixture
-def run_async(falkordb_client):
-    """``run_async(fn)``: await ``fn(client)`` on a ``falkordb.asyncio`` client, in a fresh event loop."""
-
-    def run(fn):
-        async def main():
-            client = AsyncFalkorDB(unix_socket_path=falkordb_client.client.socket_file)
-            try:
-                return await fn(client)
-            finally:
-                await client.aclose()
-
-        return asyncio.run(main())
-
-    return run
 
 
 def outcome(call):
@@ -263,6 +245,67 @@ def test_a_validation_that_times_out_leaves_no_query_running(run_async, monkeypa
     assert running["started"] > 0
     assert left_running == 0
     assert result == (1.0, [])
+
+
+# ----------------------------------------------------------------- concurrency
+# Queries whose lookups are independent: several paths, and variables without a label that access properties
+THREE_PATHS = (
+    "MATCH (g:Goal)-[:HAS_TARGET]->(t:Target)-[:HAS_INDICATOR]->(i:Indicator), "
+    "(a:GeoArea)-[:HAS_NUTS1]->(n:Nuts1) RETURN g, t, i, a, n"
+)
+UNLABELED_PROPERTIES = (
+    "MATCH (g)-[:HAS_TARGET]->(t)-[r]->(i) "
+    "WHERE g.code = '1' AND t.text = 'x' AND i.unit = 'y' RETURN g, t, i"
+)
+
+
+@pytest.mark.parametrize(
+    ("validator", "query"),
+    [
+        (AsyncSchemaValidator, THREE_PATHS),
+        (AsyncSchemaValidator, UNLABELED_PROPERTIES),
+        (AsyncPropertiesValidator, UNLABELED_PROPERTIES),
+    ],
+)
+def test_one_validation_asks_independent_lookups_at_the_same_time(
+    run_async, monkeypatch, validator, query
+):
+    """The lookups of a validation that do not depend on each other overlap, up to max_concurrency; the
+    limit changes how many are in flight, never what is asked or what is answered."""
+    now = {"in_flight": 0, "peak": 0, "sent": 0}
+    original = AsyncGraph.ro_query
+
+    async def tracked(self, *args, **kwargs):
+        now["sent"] += 1
+        now["in_flight"] += 1
+        now["peak"] = max(now["peak"], now["in_flight"])
+        try:
+            await asyncio.sleep(
+                0.005
+            )  # a round trip, so that overlapping requests are seen
+            return await original(self, *args, **kwargs)
+        finally:
+            now["in_flight"] -= 1
+
+    monkeypatch.setattr(AsyncGraph, "ro_query", tracked)
+
+    def validate_with(max_concurrency):
+        async def ask(client):
+            now.update(in_flight=0, peak=0, sent=0)
+            result = await validator(client, max_concurrency=max_concurrency).validate(
+                query, "kg"
+            )
+            return result, now["peak"], now["sent"]
+
+        return run_async(ask)
+
+    result, peak, sent = validate_with(8)
+    assert peak > 1
+    for limit in (1, 2, 3):
+        limited_result, limited_peak, limited_sent = validate_with(limit)
+        assert limited_peak == min(limit, peak)
+        assert limited_result == result
+        assert limited_sent == sent
 
 
 # ------------------------------------------------------------ clients and errors

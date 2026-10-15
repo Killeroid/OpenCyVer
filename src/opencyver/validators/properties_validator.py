@@ -5,7 +5,7 @@ import pandas as pd
 import regex as re
 
 from opencyver import _queries, patterns
-from opencyver._io import Request
+from opencyver._io import Concurrently, Request
 from opencyver.backend import (
     CypherError,
     async_snapshotted,
@@ -91,6 +91,25 @@ class _PropertiesValidator:
                 return False, metadata
         return property_exists, metadata
 
+    def __check_properties(
+        self, checks, database_name
+    ) -> Generator[Request, Any, list[tuple[bool, list]]]:
+        """Check several properties together: ``checks`` is a list of ``(label, property)``.
+
+        Returns:
+            What ``__query_prop_exist`` returns for each of them, in the same order.
+        """
+        return list(
+            (
+                yield Concurrently(
+                    tuple(
+                        self.__query_prop_exist(label, property, database_name)
+                        for label, property in checks
+                    )
+                )
+            )
+        )
+
     def __get_inferred_labels_properties(
         self,
         strict,
@@ -140,15 +159,26 @@ class _PropertiesValidator:
             if len(df_filtered.index) == 1:
                 valid_label = True  # whether all the labels have all the properties accessed on them
                 label_props = {}  # inferred label -> the properties accessed on its variable
+                # Every property is checked whatever the others give, so the checks are asked together
+                results = iter(
+                    (
+                        yield from self.__check_properties(
+                            [
+                                (df_filtered[variable].iloc[0], accessed_prop)
+                                for variable in df_filtered.columns
+                                for accessed_prop in var_props_map[variable]
+                            ],
+                            database_name,
+                        )
+                    )
+                )
                 for variable in df_filtered.columns:
                     label = df_filtered[variable].iloc[0]  # the label of the variable
                     label_props = self.__extend_dict_with_list_elements(
                         label_props, label, var_props_map[variable]
                     )
-                    for accessed_prop in var_props_map[variable]:
-                        property_exists, _ = yield from self.__query_prop_exist(
-                            label, accessed_prop, database_name
-                        )
+                    for _accessed_prop in var_props_map[variable]:
+                        property_exists, _ = next(results)
                         if not property_exists:
                             valid_label = False
                 if valid_label:
@@ -171,15 +201,25 @@ class _PropertiesValidator:
                     # The variables of a row depend on each other: every one of their labels needs its properties
                     valid_label = True  # whether all the labels have all the properties accessed on them
                     label_props = {}  # inferred label -> the properties accessed on its variable
+                    results = iter(
+                        (
+                            yield from self.__check_properties(
+                                [
+                                    (row[variable], accessed_prop)
+                                    for variable in df_filtered.columns
+                                    for accessed_prop in var_props_map[variable]
+                                ],
+                                database_name,
+                            )
+                        )
+                    )
                     for variable in df_filtered.columns:
                         label = row[variable]  # the label this row gives the variable
                         label_props = self.__extend_dict_with_list_elements(
                             label_props, label, var_props_map[variable]
                         )
-                        for accessed_prop in var_props_map[variable]:
-                            property_exists, _ = yield from self.__query_prop_exist(
-                                label, accessed_prop, database_name
-                            )
+                        for _accessed_prop in var_props_map[variable]:
+                            property_exists, _ = next(results)
                             if not property_exists:
                                 valid_label = False
                             else:
@@ -245,12 +285,22 @@ class _PropertiesValidator:
 
                 label_pair_correct_props = {}  # alternative -> how many of the properties it has
                 valid_label = True  # whether every alternative has all the properties
+                results = iter(
+                    (
+                        yield from self.__check_properties(
+                            [
+                                (label, accessed_prop)
+                                for label in disjoint_labels
+                                for accessed_prop in properties_accessed
+                            ],
+                            database_name,
+                        )
+                    )
+                )
                 for label in disjoint_labels:
                     total_correct_props = 0
-                    for accessed_prop in properties_accessed:
-                        property_exists, _ = yield from self.__query_prop_exist(
-                            label, accessed_prop, database_name
-                        )
+                    for _accessed_prop in properties_accessed:
+                        property_exists, _ = next(results)
                         if not property_exists:
                             valid_label = False
                         else:
@@ -368,26 +418,29 @@ class _PropertiesValidator:
             correct_props = 0  # the properties that exist on their label
             incorrect_label_props_map = {}  # label -> its properties that do not exist
 
+            # The properties are checked independently of each other, so the checks are asked together.
+            # Their results are used below in the order of the query, so nothing else changes.
+            checked = []  # (label, property) of every property to check
             for label, properties in label_props_map.items():
                 # For alternatives (Label1|Label2|...) check only the first: after narrowing, they all
                 # have the same number of valid properties
                 if "|" in label:
                     label = label.split("|")[0]
-                for property in properties:
-                    property_exists, notifications = yield from self.__query_prop_exist(
-                        label, property, database_name
-                    )
-                    if property_exists:
-                        correct_props += 1
-                    else:
-                        incorrect_label_props_map = (
-                            self.__extend_dict_with_list_elements(
-                                incorrect_label_props_map, label, [property]
-                            )
-                        )
+                checked.extend((label, property) for property in properties)
+            results = yield from self.__check_properties(checked, database_name)
 
-                    if notifications:  # the unknown property key warning
-                        metadata.extend(notifications)
+            for (label, property), (property_exists, notifications) in zip(
+                checked, results, strict=True
+            ):
+                if property_exists:
+                    correct_props += 1
+                else:
+                    incorrect_label_props_map = self.__extend_dict_with_list_elements(
+                        incorrect_label_props_map, label, [property]
+                    )
+
+                if notifications:  # the unknown property key warning
+                    metadata.extend(notifications)
 
             total_props = sum(
                 len(properties) for properties in label_props_map.values()

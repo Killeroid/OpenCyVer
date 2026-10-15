@@ -21,7 +21,7 @@ from opencyver._errors import (
     UNKNOWN_REL_TYPE,
     CypherError,
 )
-from opencyver._io import Explain, Recall, Remember, Request, RoQuery
+from opencyver._io import Concurrently, Explain, Recall, Remember, Request, RoQuery
 from opencyver.patterns import strip_literals_and_comments
 
 _PARAMETER = re.compile(r"\$(\w+)")
@@ -160,9 +160,16 @@ def unknown_schema_notifications(
     rel_types = {
         t for group in _REL_TYPES.findall(pattern) for t in re.findall(r"\w+", group)
     }
+    # Both lists are needed whenever the pattern has labels and types, so they are asked together
+    lookups = []
+    if labels:
+        lookups.append(schema_set(graph, "db.labels"))
+    if rel_types:
+        lookups.append(schema_set(graph, "db.relationshipTypes"))
+    known_sets = iter((yield Concurrently(tuple(lookups))))
     notifications = []
     if labels:
-        known = yield from schema_set(graph, "db.labels")
+        known = next(known_sets)
         notifications += [
             {
                 "code": UNKNOWN_LABEL,
@@ -173,7 +180,7 @@ def unknown_schema_notifications(
             for label in sorted(labels - known)
         ]
     if rel_types:
-        known = yield from schema_set(graph, "db.relationshipTypes")
+        known = next(known_sets)
         notifications += [
             {
                 "code": UNKNOWN_REL_TYPE,
@@ -224,12 +231,19 @@ def property_exists(
         tuple[bool, list[dict]]: Whether it exists, and a warning if the property key is unknown.
     """
     pattern = f"(x:{label})" if kind == "node" else f"()-[x:{label}]-()"
-    # `(x.prop) IS NOT NULL` is true only for an element that has the property
-    rows = yield from execute(
-        graph, f"MATCH {pattern} WHERE (x.{prop}) IS NOT NULL RETURN 1 LIMIT 1"
+    # `(x.prop) IS NOT NULL` is true only for an element that has the property. The property keys of the
+    # graph do not depend on that, so they are asked together with it.
+    rows, property_keys = yield Concurrently(
+        (
+            execute(
+                graph,
+                f"MATCH {pattern} WHERE (x.{prop}) IS NOT NULL RETURN 1 LIMIT 1",
+            ),
+            schema_set(graph, "db.propertyKeys"),
+        )
     )
     notifications = []
-    if prop not in (yield from schema_set(graph, "db.propertyKeys")):
+    if prop not in property_keys:
         notifications.append(
             {
                 "code": UNKNOWN_PROPERTY,

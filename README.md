@@ -175,7 +175,8 @@ asyncio.run(main())
 
 * **One implementation.** The sync and the async validators run the same validation logic, so they give identical results and make the same requests to the database.
 * **Pass an async client.** `driver` is a `falkordb.asyncio.FalkorDB` client or one of its graphs (then `database_name` can be omitted). The sync validators refuse an async client, and the async validators a sync one, with an error that names the right classes.
-* **`max_concurrency`** (default 8) is the most requests the validator has in flight at once on its connection. It must be at least 1.
+* **Independent lookups run at the same time.** Within one validation the checks that do not depend on each other are asked together: whether each node, relationship and path of the query exists, the label inference of its paths, and the property checks. With a simulated 20 ms round trip, validating a query with three paths took about 300 ms before and takes about 50 ms now. The same requests are asked as before, so the results do not change.
+* **`max_concurrency`** (default 8) is the most requests the validator has in flight at once on its connection, across everything it is validating. Set it to what your database and connection can take; `1` asks one thing at a time. It must be at least 1.
 * **One client per event loop.** The async FalkorDB client is bound to the event loop that first used it, so create it, and the validators that use it, inside the loop that runs them.
 * **Validating many queries together** shares their schema lookups when you run them inside a snapshot. Each lookup (is this a label? does it have this property?) is then asked once, even by queries running at the same time, and nothing is kept after the block ends:
 
