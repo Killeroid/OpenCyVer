@@ -45,7 +45,7 @@ Before installing, make sure you have the following Python packages installed, w
 To install the latest stable version from [PyPI](https://pypi.org/project/OpenCyVer/), run:
 
 ```sh
-pip install OpenCyVer
+pip install opencyver
 ```
 
 Alternatively, if you prefer to install the latest development version, you can install it directly from GitHub:

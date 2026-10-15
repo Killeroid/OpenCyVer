@@ -19,6 +19,14 @@ import pandas as pd
 import regex as re
 from redis.exceptions import ResponseError
 
+# ARITHMETIC_ERROR, EXECUTION_FAILED and SYNTAX_ERROR are re-exported: they are part of this module's API
+from opencyver._errors import (  # noqa: F401
+    ARITHMETIC_ERROR,
+    EXECUTION_FAILED,
+    SYNTAX_ERROR,
+    CypherError,
+    to_cypher_error,
+)
 from opencyver.patterns import strip_literals_and_comments
 
 # The codes OpenCyVer reports in its metadata. FalkorDB has no notifications of its own, so OpenCyVer produces these itself.
@@ -27,10 +35,6 @@ UNKNOWN_REL_TYPE = "OpenCyVer.Warning.UnknownRelationshipType"
 UNKNOWN_PROPERTY = "OpenCyVer.Warning.UnknownPropertyKey"
 PARAMETER_NOT_PROVIDED = "OpenCyVer.Warning.ParameterNotProvided"
 UNKNOWN_INDEX = "OpenCyVer.Warning.UnknownIndex"
-ARITHMETIC_ERROR = "OpenCyVer.Error.ArithmeticError"
-# Errors raised by FalkorDB itself
-SYNTAX_ERROR = "FalkorDB.ClientError.Statement.SyntaxError"
-EXECUTION_FAILED = "FalkorDB.DatabaseError.Statement.ExecutionFailed"
 
 _PARAMETER = re.compile(r"\$(\w+)")
 # (var:Label1:Label2 ...) -> ':Label1:Label2'
@@ -39,20 +43,6 @@ _NODE_LABELS = re.compile(r"\(\s*(?:[A-Za-z_]\w*)?((?:\s*:\s*\w+)+)")
 _REL_TYPES = re.compile(
     r"\[\s*(?:[A-Za-z_]\w*)?\s*:\s*([\w|:\s]+?)\s*(?:\*[^\]{]*)?(?:\{[^}]*\})?\s*\]"
 )
-
-
-class CypherError(Exception):
-    """A query was rejected by the database (syntax error, execution failure, ...).
-
-    Attributes:
-        code (str): Error code, e.g. ``FalkorDB.ClientError.Statement.SyntaxError``.
-        message (str): Human readable description from the database.
-    """
-
-    def __init__(self, code, message):
-        super().__init__(message)
-        self.code = code
-        self.message = message
 
 
 def snapshotted(method):
@@ -135,25 +125,7 @@ class FalkorDBBackend:
         """The ``falkordb.Graph`` to query (a graph is selected by name on every call, not kept open)."""
         return self._select_graph(self._graph_name(database_name))
 
-    @staticmethod
-    def _to_cypher_error(error):
-        """Turn a redis ``ResponseError`` into a :class:`CypherError` with one of OpenCyVer's codes.
-
-        FalkorDB reports every failure as a plain error message, so the code is chosen from the
-        wording: syntax errors, a constant division by zero, or else a failed execution.
-        """
-        message = str(error)
-        # FalkorDB rejects a constant `/ 0` while planning; for anything it does not catch, OpenCyVer reports
-        # an explicit division by zero itself (see SyntaxValidator). Use the same code and text for both.
-        if message.strip() == "Division by zero":
-            return CypherError(ARITHMETIC_ERROR, "Division by zero.")
-        if (
-            "Invalid input" in message
-            or "errMsg:" in message
-            or message.startswith("Error: empty query")
-        ):
-            return CypherError(SYNTAX_ERROR, message)
-        return CypherError(EXECUTION_FAILED, message)
+    _to_cypher_error = staticmethod(to_cypher_error)
 
     def _ro_query(self, query, database_name):
         """Run ``query`` with ``GRAPH.RO_QUERY`` (it can never modify the graph), mapping errors to CypherError."""
