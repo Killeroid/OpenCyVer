@@ -1,18 +1,17 @@
+from collections.abc import Generator
+from typing import Any
+
 import pandas as pd
 import regex as re
 
-from opencyver import patterns
+from opencyver import _queries, patterns
+from opencyver._io import Request
 from opencyver.backend import CypherError, get_backend, snapshotted
-from opencyver.utils import get_paths_after_inference, replace_with_labels
+from opencyver.utils import paths_after_inference, replace_with_labels
 
 
-class PropertiesValidator:
-    """
-    A class to validate the correctness of property access in Cypher queries against the schema of a graph.
-
-    A property access is valid if some node (or relationship) with the label (or type) has the property.
-    The label of a variable is taken from the query, or inferred from the graph when the query leaves it out.
-    """
+class _PropertiesValidator:
+    """The logic of PropertiesValidator, as generators (see ``opencyver._io``): one copy for the sync and the async validator."""
 
     def __init__(self, driver):
         """
@@ -28,7 +27,9 @@ class PropertiesValidator:
         self.driver = driver
         self.backend = get_backend(driver)
 
-    def __check_label_type(self, label, database_name=None):
+    def __check_label_type(
+        self, label, database_name=None
+    ) -> Generator[Request, Any, str]:
         """
         Check if a given label is a node label or a relationship type.
 
@@ -39,9 +40,12 @@ class PropertiesValidator:
         Returns:
             string: "node" or "relationship", "none" otherwise.
         """
-        return self.backend.label_kind(label, database_name)
+        graph = self.backend._graph_name(database_name)
+        return (yield from _queries.label_kind(graph, label))
 
-    def __query_prop_exist(self, label, property, database_name=None):
+    def __query_prop_exist(
+        self, label, property, database_name=None
+    ) -> Generator[Request, Any, tuple[bool, list]]:
         """Check if this property exists for the defined label.
 
         Args:
@@ -58,13 +62,14 @@ class PropertiesValidator:
         """
         property_exists = False
         metadata = []
-        type = self.__check_label_type(label, database_name)
+        graph = self.backend._graph_name(database_name)
+        type = yield from self.__check_label_type(label, database_name)
         if (
             type != "none"
         ):  # otherwise the label does not exist in the graph, and neither does the property
             try:
-                property_exists, notifications = self.backend.property_exists(
-                    label, type, property, database_name
+                property_exists, notifications = yield from _queries.property_exists(
+                    graph, label, type, property
                 )
                 # The warning about a property key that exists on no node or relationship at all
                 metadata.extend(
@@ -84,7 +89,7 @@ class PropertiesValidator:
         var_props_map,
         query,
         database_name=None,
-    ):
+    ) -> Generator[Request, Any, dict]:
         """
         Infers the labels of variables that have none but access properties, and adds the labels with the
         properties they are accessed with to label_props_map (label -> properties).
@@ -107,8 +112,9 @@ class PropertiesValidator:
         """
         # Infer the unknown variables
         inference_paths = self.__prepare_query_for_infer(var_label_map, query)
-        df_valid_label_pairs = get_paths_after_inference(
-            self.backend, inference_paths, database_name
+        graph = self.backend._graph_name(database_name)
+        df_valid_label_pairs = yield from paths_after_inference(
+            graph, inference_paths
         )  # DataFrames of the label combinations found for the variables
         for df_var_labels in df_valid_label_pairs:
             # Keep the columns of the variables that access properties
@@ -130,7 +136,7 @@ class PropertiesValidator:
                         label_props, label, var_props_map[variable]
                     )
                     for accessed_prop in var_props_map[variable]:
-                        property_exists, _ = self.__query_prop_exist(
+                        property_exists, _ = yield from self.__query_prop_exist(
                             label, accessed_prop, database_name
                         )
                         if not property_exists:
@@ -161,7 +167,7 @@ class PropertiesValidator:
                             label_props, label, var_props_map[variable]
                         )
                         for accessed_prop in var_props_map[variable]:
-                            property_exists, _ = self.__query_prop_exist(
+                            property_exists, _ = yield from self.__query_prop_exist(
                                 label, accessed_prop, database_name
                             )
                             if not property_exists:
@@ -200,7 +206,7 @@ class PropertiesValidator:
 
     def __infer_disjoint_labels(
         self, var_label_map, label_props_map, query, database_name
-    ):
+    ) -> Generator[Request, Any, tuple[dict, dict, str]]:
         """
         Detects alternatives (e.g. ``Label1|Label2``) that access properties, and narrows them to the
         alternatives that have the most of those properties.
@@ -232,7 +238,7 @@ class PropertiesValidator:
                 for label in disjoint_labels:
                     total_correct_props = 0
                     for accessed_prop in properties_accessed:
-                        property_exists, _ = self.__query_prop_exist(
+                        property_exists, _ = yield from self.__query_prop_exist(
                             label, accessed_prop, database_name
                         )
                         if not property_exists:
@@ -271,7 +277,9 @@ class PropertiesValidator:
 
         return var_label_map, label_props_map, query
 
-    def __get_var_labels_props(self, query, database_name):
+    def __get_var_labels_props(
+        self, query, database_name
+    ) -> Generator[Request, Any, tuple[dict, dict, dict]]:
         """
         Extract the variables, labels and properties of the query, as far as its text tells.
 
@@ -309,38 +317,27 @@ class PropertiesValidator:
         )
 
         # Alternatives (Label1|Label2) that access properties are narrowed to the ones that have them
-        var_label_map, label_props_map, query = self.__infer_disjoint_labels(
+        var_label_map, label_props_map, query = yield from self.__infer_disjoint_labels(
             var_label_map, label_props_map, query, database_name
         )
 
         return var_label_map, label_props_map, var_props_map
 
-    @snapshotted
-    def extract(self, query, database_name=None, strict=False):
-        """
-        Extract the properties accessed by each label of the provided query
-
-        Args:
-            query (str): The Cypher query to validate.
-            database_name (str | None): The graph to validate the query against. None (default) uses the graph the validator was given.
-            strict (bool): How to treat the properties accessed on a variable without a label, whose label is inferred.
-                If True, they are used only when some label has all of them; otherwise they are ignored.
-                If False, they are attributed to the label that has the most of them, so an invalid one is reported.
-
-        Returns:
-            tuple: Two dicts:
-            - var_props_map: variable without a label in the query -> the properties accessed on it;
-            - label_props_map: label (written in the query, or inferred) -> the properties accessed on it.
-        """
+    def _extract(
+        self, query, database_name=None, strict=False
+    ) -> Generator[Request, Any, tuple[dict, dict]]:
+        """The logic of ``extract``, as a generator."""
         self.backend.check_database(database_name)
         # The labels and properties the text of the query gives
-        var_label_map, label_props_map, var_props_map = self.__get_var_labels_props(
-            query, database_name
-        )
+        (
+            var_label_map,
+            label_props_map,
+            var_props_map,
+        ) = yield from self.__get_var_labels_props(query, database_name)
 
         # Infer the labels of the variables that have none but access properties
         if var_props_map:
-            label_props_map = self.__get_inferred_labels_properties(
+            label_props_map = yield from self.__get_inferred_labels_properties(
                 strict,
                 var_label_map,
                 label_props_map,
@@ -351,29 +348,12 @@ class PropertiesValidator:
 
         return var_props_map, label_props_map
 
-    @snapshotted
-    def validate(self, query, database_name=None, strict=False):
-        """
-        Validate the correctness of the properties accessed by labels in the given query against the schema of the graph.
-
-        Args:
-            query (str): The Cypher query to validate.
-            database_name (str | None): The graph to validate the query against. None (default) uses the graph the validator was given.
-            strict (bool): How to treat the properties accessed on a variable without a label: see :meth:`extract`.
-
-        Returns:
-            tuple: ``(score, metadata)``.
-
-            score (float | None): The precision, in [0, 1]: the properties that exist on their label divided by
-            all the properties accessed. None if the query accesses no property.
-
-            metadata (list[dict]): The problems found. Each dictionary includes:
-            - 'code' (str): ``InvalidPropertyAccessByLabelWarning`` for a property that its label does not have,
-              ``OpenCyVer.Warning.UnknownPropertyKey`` for a property that exists nowhere in the graph.
-            - 'description' (str): A detailed message describing the issue.
-        """
+    def _validate(
+        self, query, database_name=None, strict=False
+    ) -> Generator[Request, Any, tuple[float | None, list[dict]]]:
+        """The logic of ``validate``, as a generator."""
         metadata = []  # the problems found
-        _, label_props_map = self.extract(query, database_name, strict)
+        _, label_props_map = yield from self._extract(query, database_name, strict)
         if label_props_map:
             correct_props = 0  # the properties that exist on their label
             incorrect_label_props_map = {}  # label -> its properties that do not exist
@@ -384,7 +364,7 @@ class PropertiesValidator:
                 if "|" in label:
                     label = label.split("|")[0]
                 for property in properties:
-                    property_exists, notifications = self.__query_prop_exist(
+                    property_exists, notifications = yield from self.__query_prop_exist(
                         label, property, database_name
                     )
                     if property_exists:
@@ -618,3 +598,54 @@ class PropertiesValidator:
         inference_paths = [path for path in no_prop_paths if re.search(pattern, path)]
 
         return inference_paths
+
+
+class PropertiesValidator(_PropertiesValidator):
+    """
+    A class to validate the correctness of property access in Cypher queries against the schema of a graph.
+
+    A property access is valid if some node (or relationship) with the label (or type) has the property.
+    The label of a variable is taken from the query, or inferred from the graph when the query leaves it out.
+    """
+
+    @snapshotted
+    def extract(self, query, database_name=None, strict=False):
+        """
+        Extract the properties accessed by each label of the provided query
+
+        Args:
+            query (str): The Cypher query to validate.
+            database_name (str | None): The graph to validate the query against. None (default) uses the graph the validator was given.
+            strict (bool): How to treat the properties accessed on a variable without a label, whose label is inferred.
+                If True, they are used only when some label has all of them; otherwise they are ignored.
+                If False, they are attributed to the label that has the most of them, so an invalid one is reported.
+
+        Returns:
+            tuple: Two dicts:
+            - var_props_map: variable without a label in the query -> the properties accessed on it;
+            - label_props_map: label (written in the query, or inferred) -> the properties accessed on it.
+        """
+        return self.backend.run(self._extract(query, database_name, strict))
+
+    @snapshotted
+    def validate(self, query, database_name=None, strict=False):
+        """
+        Validate the correctness of the properties accessed by labels in the given query against the schema of the graph.
+
+        Args:
+            query (str): The Cypher query to validate.
+            database_name (str | None): The graph to validate the query against. None (default) uses the graph the validator was given.
+            strict (bool): How to treat the properties accessed on a variable without a label: see :meth:`extract`.
+
+        Returns:
+            tuple: ``(score, metadata)``.
+
+            score (float | None): The precision, in [0, 1]: the properties that exist on their label divided by
+            all the properties accessed. None if the query accesses no property.
+
+            metadata (list[dict]): The problems found. Each dictionary includes:
+            - 'code' (str): ``InvalidPropertyAccessByLabelWarning`` for a property that its label does not have,
+              ``OpenCyVer.Warning.UnknownPropertyKey`` for a property that exists nowhere in the graph.
+            - 'description' (str): A detailed message describing the issue.
+        """
+        return self.backend.run(self._validate(query, database_name, strict))
