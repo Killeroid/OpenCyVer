@@ -13,11 +13,11 @@ Requests are:
 
 * :class:`RoQuery`: ``GRAPH.RO_QUERY``. The answer is falkordb's ``QueryResult``.
 * :class:`Explain`: ``GRAPH.EXPLAIN``. The answer is ``None``: it only matters that the database accepts the query.
-* :class:`Many`: several of the above that do not depend on each other. The answer is the tuple of their
-  answers. The sync driver runs them one after the other, the async driver at the same time (at most
-  ``max_concurrency`` at once). Either way every request runs, and then the first error, in request order, is
-  thrown into the generator.
-
+* :class:`Concurrently`: several logic generators that do not depend on each other (each may ask many requests,
+  one after another). The answer is the tuple of what they return. The sync driver runs them one after the
+  other, the async driver at the same time; the number of requests in flight at once is still limited by
+  ``max_concurrency``. Either way every generator runs, and then the first error, in order, is thrown into
+  the generator that asked.
 * :class:`Remember` and :class:`Recall`: keep a value the logic worked out (such as "this graph has no schema
   yet", which is not an answer the database gave) for the rest of the snapshot, and get it back. They never
   reach the database.
@@ -52,10 +52,13 @@ class Explain:
 
 
 @dataclass(frozen=True)
-class Many:
-    """Requests (a tuple of :class:`RoQuery` / :class:`Explain`) that can be answered in any order."""
+class Concurrently:
+    """Logic generators (a tuple) that do not depend on each other and can run at the same time.
 
-    requests: tuple
+    The answer is the tuple of what they return, in order.
+    """
+
+    generators: tuple
 
 
 @dataclass(frozen=True)
@@ -74,7 +77,7 @@ class Recall:
 
 
 # What a logic generator may yield
-Request = RoQuery | Explain | Many | Remember | Recall
+Request = RoQuery | Explain | Concurrently | Remember | Recall
 
 
 # ---------------------------------------------------------------------- snapshots
@@ -192,7 +195,10 @@ def run_sync(generator, transport):
     Returns:
         What the generator returns.
     """
-    answers = _answers_kept_for(transport)
+    return _drive_sync(generator, transport, _answers_kept_for(transport))
+
+
+def _drive_sync(generator, transport, answers):
     answer = error = None
     with closing(generator):
         while True:
@@ -220,13 +226,13 @@ def _answer_remembered(request, answers):
 def _answer_sync(request, transport, answers):
     if isinstance(request, Remember | Recall):
         return _answer_remembered(request, answers)
-    if not isinstance(request, Many):
+    if not isinstance(request, Concurrently):
         return _answer_one_sync(request, transport, answers)
     results, first_error = [], None
-    for single in request.requests:
+    for generator in request.generators:
         try:
-            results.append(_answer_one_sync(single, transport, answers))
-        except Exception as e:  # noqa: BLE001 - the first error is raised once every request has run
+            results.append(_drive_sync(generator, transport, answers))
+        except Exception as e:  # noqa: BLE001 - the first error is raised once every generator has run
             results.append(None)
             if first_error is None:
                 first_error = e
@@ -249,7 +255,10 @@ async def run_async(generator, transport):
     Returns:
         What the generator returns.
     """
-    answers = _answers_kept_for(transport)
+    return await _drive_async(generator, transport, _answers_kept_for(transport))
+
+
+async def _drive_async(generator, transport, answers):
     answer = error = None
     with closing(generator):
         while True:
@@ -269,10 +278,13 @@ async def run_async(generator, transport):
 async def _answer_async(request, transport, answers):
     if isinstance(request, Remember | Recall):
         return _answer_remembered(request, answers)
-    if not isinstance(request, Many):
+    if not isinstance(request, Concurrently):
         return await _answer_one_async(request, transport, answers)
     outcomes = await asyncio.gather(
-        *(_answer_one_async(single, transport, answers) for single in request.requests),
+        *(
+            _drive_async(generator, transport, answers)
+            for generator in request.generators
+        ),
         return_exceptions=True,
     )
     for outcome in outcomes:

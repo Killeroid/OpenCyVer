@@ -5,7 +5,7 @@ from typing import Any
 import pandas as pd
 import regex as re
 
-from opencyver._io import Request
+from opencyver._io import Concurrently, Request
 from opencyver._queries import query_to_df
 from opencyver.backend import CypherError, get_async_backend, get_backend
 
@@ -122,21 +122,35 @@ async def get_paths_after_inference_async(
     return await backend.run(paths_after_inference(graph, all_paths_with_vars))
 
 
+def _label_combinations(
+    graph: str, path: str
+) -> Generator[Request, Any, tuple[pd.DataFrame | None, list, list]]:
+    """Ask the database for the label and type combinations of one path.
+
+    Returns:
+        The DataFrame (columns: the vars of the path, rows: the valid label combinations) or None if the
+        database rejected the inference query, and the node and relationship variables of the path.
+    """
+    query_w_labels, node_vars, rel_vars = identify_variables_and_construct_query(path)
+    try:
+        return (yield from query_to_df(graph, query_w_labels)), node_vars, rel_vars
+    except CypherError:
+        # The inference query was rejected (e.g. FalkorDB.ClientError.Statement.SyntaxError)
+        return None, node_vars, rel_vars
+
+
 def paths_after_inference(
     graph: str, all_paths_with_vars: list
 ) -> Generator[Request, Any, list[pd.DataFrame]]:
     """The logic of :func:`get_paths_after_inference` on the resolved graph name, as a generator (see ``opencyver._io``)."""
+    # The paths do not depend on each other, so their queries are asked together (they are joined below, in order)
+    combinations = yield Concurrently(
+        tuple(_label_combinations(graph, path) for path in all_paths_with_vars)
+    )
     df_list = []  # the final DataFrames
-    for path in all_paths_with_vars:
-        query_w_labels, node_vars, rel_vars = identify_variables_and_construct_query(
-            path
-        )
-        try:
-            # dataframe with columns the vars of the path and rows the valid label combinations
-            df_var_labels = yield from query_to_df(graph, query_w_labels)
-        except CypherError:
-            # The inference query was rejected (e.g. FalkorDB.ClientError.Statement.SyntaxError), so no
-            # label combination is known for this path: keep its variables, with no rows
+    for df_var_labels, node_vars, rel_vars in combinations:
+        if df_var_labels is None:
+            # No label combination is known for this path: keep its variables, with no rows
             df_list.append(
                 pd.DataFrame(columns=list(dict.fromkeys(node_vars + rel_vars)))
             )

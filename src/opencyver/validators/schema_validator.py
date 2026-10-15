@@ -4,7 +4,7 @@ from typing import Any
 import regex as re
 
 from opencyver import _queries, patterns
-from opencyver._io import Request
+from opencyver._io import Concurrently, Request
 from opencyver.backend import (
     UNKNOWN_INDEX,
     UNKNOWN_LABEL,
@@ -421,12 +421,25 @@ class _SchemaValidator:
         # The distinct notifications, in the order they were found (a dict is an ordered set)
         metadata = {}
 
+        # The nodes, relationships and paths are checked independently of each other, so the checks are asked
+        # together. Their results are used below in the order of the query, so nothing else changes.
+        results = yield Concurrently(
+            tuple(
+                [self.__check_path_exists(node, None, database_name) for node in nodes]
+                + [self.__check_path_exists(rel, None, database_name) for rel in rels]
+                + [
+                    self.__check_path_exists(path, original_path_map, database_name)
+                    for path in paths
+                ]
+            )
+        )
+        node_results = results[: len(nodes)]
+        rel_results = results[len(nodes) : len(nodes) + len(rels)]
+        path_results = results[len(nodes) + len(rels) :]
+
         if nodes:
             common_nodes = 0
-            for node in nodes:
-                node_exists, node_notifications = yield from self.__check_path_exists(
-                    node, None, database_name
-                )
+            for node_exists, node_notifications in node_results:
                 common_nodes += int(
                     node_exists
                 )  # Convert boolean to integer and sum it
@@ -437,10 +450,7 @@ class _SchemaValidator:
                     )
         if rels:
             common_rels = 0
-            for rel in rels:
-                rel_exists, rel_notifications = yield from self.__check_path_exists(
-                    rel, None, database_name
-                )
+            for rel_exists, rel_notifications in rel_results:
                 common_rels += int(rel_exists)
                 if rel_notifications:
                     # OpenCyVer.Warning.UnknownRelationshipType
@@ -449,10 +459,7 @@ class _SchemaValidator:
                     )
         if paths:
             common_paths = 0
-            for path in paths:
-                path_exists, path_notifications = yield from self.__check_path_exists(
-                    path, original_path_map, database_name
-                )
+            for path_exists, path_notifications in path_results:
                 common_paths += int(path_exists)
                 if path_notifications:
                     # OpenCyVer.Warning.UnknownLabel

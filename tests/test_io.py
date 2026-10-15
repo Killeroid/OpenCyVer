@@ -14,8 +14,8 @@ from opencyver._errors import (
 )
 from opencyver._io import (
     AsyncTransport,
+    Concurrently,
     Explain,
-    Many,
     Recall,
     Remember,
     RoQuery,
@@ -72,6 +72,16 @@ def asks(*requests):
     for request in requests:
         answers.append((yield request))
     return answers
+
+
+def single(request):
+    """A logic generator that asks one request and returns its answer."""
+    return (yield request)
+
+
+def together(*requests):
+    """Ask the requests at the same time: a Concurrently of generators that each ask one."""
+    return Concurrently(tuple(single(request) for request in requests))
 
 
 def database_error(message="boom"):
@@ -136,20 +146,20 @@ def test_the_generator_is_closed_when_an_error_stops_the_run(mode):
     assert cleaned == [True]
 
 
-# ------------------------------------------------------------------------------ Many
-def test_many_answers_in_request_order(mode):
+# ------------------------------------------------------------------------ Concurrently
+def test_concurrently_answers_in_order(mode):
     transport, run = mode
-    assert run(asks(Many((A, B))), transport) == [("answer to A", "answer to B")]
+    assert run(asks(together(A, B)), transport) == [("answer to A", "answer to B")]
 
 
-def test_many_runs_every_request_and_throws_the_first_error_in_request_order(mode):
+def test_concurrently_runs_every_generator_and_throws_the_first_error_in_order(mode):
     transport, run = mode
     transport.errors[BAD] = database_error("first")
     transport.errors[WORSE] = database_error("second")
 
     def logic():
         try:
-            yield Many((A, BAD, B, WORSE))
+            yield together(A, BAD, B, WORSE)
         except CypherError as e:
             return e.message
 
@@ -305,11 +315,11 @@ def requests(count):
     return tuple(RoQuery("g", f"Q{i}") for i in range(count))
 
 
-def test_many_runs_at_the_same_time_up_to_max_concurrency():
+def test_concurrently_runs_at_the_same_time_up_to_max_concurrency():
     async def peak(limit, count):
         tracker = Tracker()
         transport = AsyncTransport(tracker.select_graph, max_concurrency=limit)
-        await run_async(asks(Many(requests(count))), transport)
+        await run_async(asks(together(*requests(count))), transport)
         return tracker.peak
 
     assert asyncio.run(peak(limit=8, count=5)) == 5
@@ -322,7 +332,7 @@ def test_a_transport_can_be_used_from_another_event_loop():
     transport = AsyncTransport(tracker.select_graph, max_concurrency=2)
 
     async def burst():
-        await run_async(asks(Many(requests(6))), transport)
+        await run_async(asks(together(*requests(6))), transport)
 
     for _ in range(2):  # each asyncio.run is a new event loop
         tracker.peak = 0
@@ -340,9 +350,9 @@ def test_a_request_already_in_flight_is_not_sent_again():
         tracker = Tracker()
         transport = AsyncTransport(tracker.select_graph)
         with snapshot(transport):
-            # twice in one Many, and again from a second run alongside the first
+            # twice in one Concurrently, and again from a second run alongside the first
             await asyncio.gather(
-                run_async(asks(Many((A, A, B))), transport),
+                run_async(asks(together(A, A, B)), transport),
                 run_async(asks(A), transport),
             )
         return tracker.calls
@@ -361,7 +371,7 @@ def test_a_failed_request_is_shared_by_those_waiting_and_then_forgotten():
 
         def logic():
             try:
-                yield Many((BAD, BAD))
+                yield together(BAD, BAD)
             except CypherError:
                 return "failed"
 
@@ -425,6 +435,126 @@ def test_a_run_arriving_after_the_last_waiter_left_asks_again():
             return await run_async(asks(A), transport), len(tracker.calls)
 
     assert asyncio.run(main()) == (["rows of A"], 2)
+
+
+def steps(name, count):
+    """A logic generator that asks ``count`` requests one after another, each after the previous one's answer."""
+    answers = []
+    for i in range(count):
+        answers.append((yield RoQuery("g", f"{name}{i}")))
+    return answers
+
+
+def test_concurrently_runs_generators_that_ask_several_requests(mode):
+    transport, run = mode
+    answers = run(
+        asks(Concurrently((steps("a", 3), steps("b", 2), steps("c", 1)))), transport
+    )
+    assert answers == [
+        (
+            ["answer to a0", "answer to a1", "answer to a2"],
+            ["answer to b0", "answer to b1"],
+            ["answer to c0"],
+        )
+    ]
+    # whatever the interleaving, each generator asked its requests in its own order
+    for name in "abc":
+        asked = [r.query for r in transport.calls if r.query.startswith(name)]
+        assert asked == sorted(asked)
+    assert len(transport.calls) == 6
+
+
+def test_a_sync_run_does_one_generator_after_the_other():
+    transport = SyncFake()
+    run_sync(asks(Concurrently((steps("a", 2), steps("b", 2)))), transport)
+    assert [r.query for r in transport.calls] == ["a0", "a1", "b0", "b1"]
+
+
+def test_concurrently_nests(mode):
+    transport, run = mode
+
+    def outer():
+        inner = yield Concurrently((steps("x", 2), steps("y", 2)))
+        return inner
+
+    (answers,) = run(asks(Concurrently((outer(),))), transport)
+    assert answers == (
+        (["answer to x0", "answer to x1"], ["answer to y0", "answer to y1"]),
+    )
+
+
+def test_a_generator_that_catches_its_own_error_does_not_disturb_the_others(mode):
+    transport, run = mode
+    transport.errors[RoQuery("g", "b0")] = database_error()
+
+    def careful():
+        try:
+            yield RoQuery("g", "b0")
+        except CypherError:
+            return "recovered"
+
+    answers = run(
+        asks(Concurrently((steps("a", 2), careful(), steps("c", 2)))), transport
+    )
+    assert answers == [
+        (
+            ["answer to a0", "answer to a1"],
+            "recovered",
+            ["answer to c0", "answer to c1"],
+        )
+    ]
+
+
+def test_an_error_stops_only_its_own_generator(mode):
+    transport, run = mode
+    transport.errors[RoQuery("g", "b1")] = database_error("second step of b")
+
+    def logic():
+        try:
+            yield Concurrently((steps("a", 3), steps("b", 3), steps("c", 3)))
+        except CypherError as e:
+            return e.message
+
+    assert run(logic(), transport) == "second step of b"
+    asked = sorted(r.query for r in transport.calls)
+    # a and c ran to the end, b stopped at its failing step
+    assert asked == ["a0", "a1", "a2", "b0", "b1", "c0", "c1", "c2"]
+
+
+def test_generators_that_ask_several_requests_overlap_up_to_max_concurrency():
+    async def run(limit):
+        tracker = Tracker()
+        transport = AsyncTransport(tracker.select_graph, max_concurrency=limit)
+        answers = await run_async(
+            asks(Concurrently(tuple(steps(f"g{i}_", 3) for i in range(4)))), transport
+        )
+        return tracker.peak, len(tracker.calls), answers
+
+    peak, sent, (answers,) = asyncio.run(run(limit=8))
+    assert (peak, sent) == (4, 12)  # four generators, each a chain of three
+    assert answers[2] == ["rows of g2_0", "rows of g2_1", "rows of g2_2"]
+    assert asyncio.run(run(limit=2))[0] == 2
+    assert asyncio.run(run(limit=1))[0] == 1
+
+
+def test_cancelling_a_run_cancels_the_generators_running_together():
+    async def main():
+        tracker = Tracker()
+        tracker.delay = 5
+        transport = AsyncTransport(tracker.select_graph, max_concurrency=4)
+        with snapshot(transport):
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(
+                    run_async(
+                        asks(Concurrently(tuple(steps(f"g{i}_", 2) for i in range(4)))),
+                        transport,
+                    ),
+                    0.05,
+                )
+            await asyncio.sleep(0.05)  # let the cancelled queries unwind
+            return tracker.in_flight
+
+    assert asyncio.run(main()) == 0
 
 
 # --------------------------------------------------------------------- transports
