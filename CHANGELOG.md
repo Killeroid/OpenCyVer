@@ -1,3 +1,13 @@
+## Unreleased
+
+### Changed
+
+* **The minimum Python version is now 3.11** (it was 3.10), which reached end-of-life on 1 October 2026. The tests need FalkorDBLite, which supports Python 3.12 and newer, so on 3.11 FalkorDBLite is not installed and most of the test suite is skipped: only the tests that need no engine run there, and the full suite runs on 3.12 and newer. `pip` on Python 3.10 keeps installing 3.1.0.
+
+### Added
+
+* A CI workflow (`.github/workflows/ci.yml`) runs the lint, format, type and test checks on every pull request and on every push to `main`: the full suite on Python 3.12, 3.13 and 3.14, and the tests that need no engine on Python 3.11. Before, the checks ran only when a release tag was pushed, on Python 3.12.
+
 ## v3.1.0 (2026-10-16)
 
 ### Added

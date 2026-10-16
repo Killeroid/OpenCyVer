@@ -10,7 +10,7 @@
 
 <div align="center">
 
-[![License](https://img.shields.io/badge/License-CC_BY_SA_4.0-blue.svg)](https://creativecommons.org/licenses/by-sa/4.0/)[![Python](https://img.shields.io/badge/Python-%3E%3D3.10-brightgreen)](https://www.python.org/)[![Documentation](https://img.shields.io/badge/Documentation-online-orange)](https://github.com/Killeroid/OpenCyVer/tree/main/docs)[![Cite](https://img.shields.io/badge/Cite%20as-doi-yellow)](https://ieeexplore.ieee.org/document/10990239)
+[![License](https://img.shields.io/badge/License-CC_BY_SA_4.0-blue.svg)](https://creativecommons.org/licenses/by-sa/4.0/)[![Python](https://img.shields.io/badge/Python-%3E%3D3.11-brightgreen)](https://www.python.org/)[![Documentation](https://img.shields.io/badge/Documentation-online-orange)](https://github.com/Killeroid/OpenCyVer/tree/main/docs)[![Cite](https://img.shields.io/badge/Cite%20as-doi-yellow)](https://ieeexplore.ieee.org/document/10990239)
 
 </div>
 
@@ -35,7 +35,7 @@ For documentation read the [demo notebooks](https://github.com/Killeroid/OpenCyV
 
 ## 📋 Requirements
 
-Before installing, make sure you have the following Python packages installed, with Python version >= 3.10:
+Before installing, make sure you have the following Python packages installed, with Python version >= 3.11:
 
 * regex>=2024.11.6
 * falkordb>=1.8.0
