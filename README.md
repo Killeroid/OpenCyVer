@@ -187,6 +187,34 @@ asyncio.run(main())
   ```
 * **Timeouts and cancellation work.** `await asyncio.wait_for(validator.validate(query, database_name), timeout=5)` cancels the queries it started when it times out, which frees their `max_concurrency` slots for the next call.
 
+#### Using FalkorDBLite's async client
+
+OpenCyVer works with any `falkordb.asyncio` client, but FalkorDBLite 0.10.0's own `AsyncFalkorDB` (`redislite.async_falkordb_client`) has a bug on exit: you see `RuntimeWarning: coroutine 'AsyncManagementCommands.shutdown' was never awaited`. It is not only cosmetic. FalkorDBLite then waits about 5 seconds and kills its embedded server with `SIGKILL` without saving, so exiting is slower and **data written to a persistent database file can be lost**. The problem is in FalkorDBLite ([#61](https://github.com/FalkorDB/falkordblite/issues/61)), not in OpenCyVer.
+
+Until it is fixed, let the sync embedded client own the server and attach the regular async client to its socket:
+
+```sh
+from falkordb.asyncio import FalkorDB
+from redislite.falkordb_client import FalkorDB as EmbeddedFalkorDB
+
+embedded = EmbeddedFalkorDB("/path/to/graph.db")   # starts the server, stops it cleanly with a save
+client = FalkorDB(unix_socket_path=embedded.client.socket_file)
+try:
+    validator = AsyncSchemaValidator(client)
+    score, metadata = await validator.validate(query, "my_graph")
+finally:
+    await client.aclose()
+```
+
+If you keep using `AsyncFalkorDB`, shut the server down yourself before leaving the `async with`:
+
+```sh
+with contextlib.suppress(redis.RedisError):
+    await db.connection.shutdown(save=True, now=True, force=True)
+```
+
+Don't set `_async_managed = True` to silence the warning: it leaves the server running after your program exits.
+
 ## 📊 **Tip:**
 
 > Always start with the **SyntaxValidator** before using the **Schema** and *Properties* validators. Even a small syntax error can cause misleading results in downstream validation. Ensuring syntactic correctness first helps you avoid wasted time and confusion. Building on this principle, we define the KG Valid Query metric to systematically evaluate generated Cypher queries for knowledge graphs.
